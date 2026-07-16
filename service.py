@@ -1,0 +1,747 @@
+from __future__ import annotations
+
+import asyncio
+import math
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from nonebot import get_bots, get_driver, logger
+from nonebot.adapters.onebot.v11 import Bot, MessageSegment
+
+from .config import Config, dump_config
+from .steam_api import PlayerStatus, SteamApi
+from .storage import JsonStore
+
+
+PERSONA_TEXT = {
+    0: "离线",
+    1: "在线",
+    2: "忙碌",
+    3: "离开",
+    4: "打盹",
+    5: "想交易",
+    6: "想玩游戏",
+}
+
+
+class SteamStatusService:
+    def __init__(self, config: Config):
+        self.store = JsonStore(Path.cwd() / "data" / "steam_status_monitor")
+        self.config = dump_config(config)
+        self.config.update(self.store.load("config_overrides.json", {}))
+
+        self.group_steam_ids: dict[str, list[str]] = self.store.load("steam_groups.json", {})
+        self.group_last_states: dict[str, dict[str, dict[str, Any]]] = self.store.load(
+            "group_states.json", {}
+        )
+        self.group_start_play_times: dict[str, dict[str, dict[str, int]]] = self.store.load(
+            "start_play_times.json", {}
+        )
+        self.group_pending_quit: dict[str, dict[str, dict[str, dict[str, Any]]]] = self.store.load(
+            "pending_quit.json", {}
+        )
+        self.play_records: dict[str, dict[str, dict[str, dict[str, Any]]]] = self.store.load(
+            "play_records.json", {}
+        )
+        self.bind_data: dict[str, dict[str, str]] = self.store.load("bind_data.json", {})
+        self.push_groups: dict[str, list[str]] = self.store.load("push_groups.json", {})
+        self.notify_bots: dict[str, str] = self.store.load("notify_bots.json", {})
+        self.group_flags: dict[str, dict[str, bool]] = self.store.load("group_flags.json", {})
+        self.rank_push: dict[str, Any] = self.store.load(
+            "rank_push_groups.json", {"groups": [], "all": False}
+        )
+
+        self.next_poll_time: dict[str, dict[str, int]] = {}
+        self.achievement_snapshots: dict[tuple[str, str, str], set[str]] = {}
+        self.achievement_tasks: dict[tuple[str, str, str], asyncio.Task] = {}
+        self._achievement_blacklist: set[str] = set(self.store.load("achievement_blacklist.json", []))
+        self._recorded_quit_cache: dict[tuple[str, str], float] = {}
+        self._last_rank_push_day: str | None = None
+        self._poll_lock = asyncio.Lock()
+
+        self.api = self._build_api()
+
+    def _build_api(self) -> SteamApi:
+        proxy = self.config.get("proxy_url") if self.config.get("enable_proxy") else None
+        return SteamApi(
+            api_key=self.config.get("steam_api_key", ""),
+            api_base=self.config.get("steam_api_base", "https://api.steampowered.com"),
+            store_base=self.config.get("steam_store_base", "https://store.steampowered.com"),
+            retry_times=int(self.config.get("retry_times", 3)),
+            proxy=proxy,
+        )
+
+    def _refresh_api_config(self) -> None:
+        proxy = self.config.get("proxy_url") if self.config.get("enable_proxy") else None
+        self.api.update(
+            api_key=self.config.get("steam_api_key", ""),
+            api_base=self.config.get("steam_api_base", "https://api.steampowered.com"),
+            store_base=self.config.get("steam_store_base", "https://store.steampowered.com"),
+            retry_times=int(self.config.get("retry_times", 3)),
+            proxy=proxy,
+        )
+
+    def save_static(self) -> None:
+        self.store.save("steam_groups.json", self.group_steam_ids)
+        self.store.save("bind_data.json", self.bind_data)
+        self.store.save("push_groups.json", self.push_groups)
+        self.store.save("notify_bots.json", self.notify_bots)
+        self.store.save("group_flags.json", self.group_flags)
+        self.store.save("rank_push_groups.json", self.rank_push)
+
+    def save_runtime(self) -> None:
+        self.store.save("group_states.json", self.group_last_states)
+        self.store.save("start_play_times.json", self.group_start_play_times)
+        self.store.save("pending_quit.json", self.group_pending_quit)
+        self.store.save("play_records.json", self._clean_play_records())
+        self.store.save("achievement_blacklist.json", sorted(self._achievement_blacklist))
+
+    def save_config_overrides(self) -> None:
+        self.store.save("config_overrides.json", self.config)
+        self._refresh_api_config()
+
+    def _clean_play_records(self) -> dict[str, dict[str, dict[str, dict[str, Any]]]]:
+        cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        self.play_records = {
+            day: data for day, data in self.play_records.items() if str(day) >= cutoff
+        }
+        return self.play_records
+
+    def is_group_enabled(self, group_id: str) -> bool:
+        return self.group_flags.get(group_id, {}).get("monitor", False)
+
+    def set_group_enabled(self, group_id: str, enabled: bool) -> None:
+        self.group_flags.setdefault(group_id, {})["monitor"] = enabled
+        self.save_static()
+
+    def is_achievement_enabled(self, group_id: str) -> bool:
+        return self.group_flags.get(group_id, {}).get("achievement", True)
+
+    def set_achievement_enabled(self, group_id: str, enabled: bool) -> None:
+        self.group_flags.setdefault(group_id, {})["achievement"] = enabled
+        self.save_static()
+
+    async def send_group_text(self, group_id: str, text: str) -> bool:
+        if not text:
+            return False
+        bots = get_bots()
+        bot_id = self.notify_bots.get(group_id)
+        bot = bots.get(bot_id) if bot_id else None
+        if not bot and bots:
+            bot = next(iter(bots.values()))
+        if not bot:
+            logger.warning(f"[steam_status_monitor] 无可用 Bot，无法推送群 {group_id}")
+            return False
+        try:
+            await bot.send_group_msg(group_id=int(group_id), message=MessageSegment.text(text))
+            return True
+        except Exception as exc:
+            logger.warning(f"[steam_status_monitor] 推送群 {group_id} 失败: {exc}")
+            return False
+
+    def remember_bot(self, group_id: str, bot: Bot) -> None:
+        self.notify_bots[group_id] = bot.self_id
+        self.save_static()
+
+    def _target_groups(self, group_id: str, sid: str) -> list[str]:
+        groups = [group_id]
+        for gid in self.push_groups.get(sid, []):
+            if gid not in groups:
+                groups.append(gid)
+        return groups
+
+    async def send_to_targets(self, group_id: str, sid: str, text: str) -> None:
+        for target in self._target_groups(group_id, sid):
+            await self.send_group_text(target, text)
+
+    def display_name(self, sid: str, steam_name: str | None = None) -> str:
+        for info in self.bind_data.values():
+            if info.get("sid") == sid:
+                nickname = info.get("nickname")
+                if nickname and nickname != "*":
+                    return nickname
+        return steam_name or sid
+
+    def bind_qq(self, qq: str, sid: str, nickname: str | None = None) -> None:
+        self.bind_data[str(qq)] = {"sid": sid, "nickname": nickname or "*"}
+        self.save_static()
+
+    async def add_steam_ids(
+        self, group_id: str, raw_values: list[str], qq: str | None = None, nickname: str | None = None
+    ) -> tuple[list[str], list[str], list[str]]:
+        resolved: list[str] = []
+        invalid: list[str] = []
+        for raw in raw_values:
+            sid = await self.api.resolve_steam_input(raw)
+            if sid and sid.isdigit() and len(sid) == 17:
+                if sid not in resolved:
+                    resolved.append(sid)
+            else:
+                invalid.append(raw)
+
+        ids = self.group_steam_ids.setdefault(group_id, [])
+        added: list[str] = []
+        already: list[str] = []
+        limit = int(self.config.get("max_group_size", 20))
+        for sid in resolved:
+            if sid in ids:
+                already.append(sid)
+            elif len(ids) < limit:
+                ids.append(sid)
+                added.append(sid)
+        if qq and resolved:
+            for sid in resolved:
+                self.bind_qq(qq, sid, nickname)
+        self.save_static()
+        return added, already, invalid
+
+    async def delete_steam_id(self, group_id: str, raw_value: str) -> tuple[bool, str]:
+        sid = await self.api.resolve_steam_input(raw_value)
+        if not sid:
+            return False, "无法解析为有效 SteamID。"
+        ids = self.group_steam_ids.get(group_id, [])
+        if sid not in ids:
+            return False, f"SteamID {sid} 不在群 {group_id} 的监控列表中。"
+        ids.remove(sid)
+        self.group_steam_ids[group_id] = ids
+        for qq, info in list(self.bind_data.items()):
+            if info.get("sid") == sid:
+                self.bind_data.pop(qq, None)
+        self.save_static()
+        return True, sid
+
+    async def start_group(self, group_id: str, bot: Bot) -> str:
+        if not self.config.get("steam_api_key"):
+            return "未配置 steam_api_key，请先在 .env 或 /steam set steam_api_key 中配置。"
+        ids = self.group_steam_ids.get(group_id, [])
+        if not ids:
+            return "本群还没有监控任何 SteamID，请先使用 /steam addid 添加。"
+
+        self.remember_bot(group_id, bot)
+        self.set_group_enabled(group_id, True)
+        self.group_last_states.setdefault(group_id, {})
+        self.group_start_play_times.setdefault(group_id, {})
+        status_map = await self.api.fetch_player_statuses(ids)
+        now = int(time.time())
+        for sid, status in status_map.items():
+            self.group_last_states[group_id][sid] = status.to_json()
+            if status.gameid:
+                self.group_start_play_times[group_id].setdefault(sid, {})[status.gameid] = now
+                self.next_poll_time.setdefault(group_id, {})[sid] = now + 60
+        self.save_runtime()
+        return "本群 Steam 状态监控已启动。"
+
+    def stop_group(self, group_id: str) -> str:
+        self.set_group_enabled(group_id, False)
+        self.next_poll_time.pop(group_id, None)
+        self.group_pending_quit.pop(group_id, None)
+        for key, task in list(self.achievement_tasks.items()):
+            if key[0] == group_id:
+                task.cancel()
+                self.achievement_tasks.pop(key, None)
+                self.achievement_snapshots.pop(key, None)
+        self.save_runtime()
+        return "本群 Steam 状态监控已关闭。"
+
+    async def poll_due(self) -> None:
+        if not self.config.get("steam_api_key"):
+            return
+        async with self._poll_lock:
+            await self._maybe_push_daily_rank()
+            now = int(time.time())
+            group_sids: dict[str, list[str]] = {}
+            all_sids: set[str] = set()
+            for group_id, ids in self.group_steam_ids.items():
+                if not self.is_group_enabled(group_id):
+                    continue
+                due = [
+                    sid
+                    for sid in ids
+                    if now >= self.next_poll_time.setdefault(group_id, {}).get(sid, 0)
+                ]
+                if due:
+                    group_sids[group_id] = due
+                    all_sids.update(due)
+
+            if not group_sids:
+                await self._finalize_due_quits()
+                return
+
+            status_map = await self.api.fetch_player_statuses(list(all_sids))
+            logs: list[str] = []
+            for group_id, ids in group_sids.items():
+                for sid in ids:
+                    line = await self._process_status(group_id, sid, status_map.get(sid))
+                    if line:
+                        logs.append(f"群 {group_id}: {line}")
+            await self._finalize_due_quits()
+            self.save_runtime()
+            if logs and self.config.get("detailed_poll_log", True):
+                logger.info("[steam_status_monitor] 轮询完成\n" + "\n".join(logs))
+
+    async def _process_status(
+        self, group_id: str, sid: str, status: PlayerStatus | None
+    ) -> str | None:
+        now = int(time.time())
+        if not status:
+            self._schedule_next_poll(group_id, sid, None)
+            return f"{sid} 状态获取失败"
+
+        states = self.group_last_states.setdefault(group_id, {})
+        start_times = self.group_start_play_times.setdefault(group_id, {})
+        pending = self.group_pending_quit.setdefault(group_id, {}).setdefault(sid, {})
+        prev = states.get(sid)
+        prev_gameid = prev.get("gameid") if prev else None
+        current_gameid = status.gameid
+        player_name = self.display_name(sid, status.name)
+        zh_game_name, _ = await self.api.get_game_names(current_gameid, status.gameextrainfo)
+
+        if not prev:
+            states[sid] = status.to_json()
+            if current_gameid:
+                start_times.setdefault(sid, {})[current_gameid] = now
+            self._schedule_next_poll(group_id, sid, status)
+            return self._status_line(player_name, status, zh_game_name)
+
+        if prev_gameid and prev_gameid != current_gameid:
+            prev_name = prev.get("gameextrainfo") or "未知游戏"
+            zh_prev_name, _ = await self.api.get_game_names(prev_gameid, prev_name)
+            start_time = self._get_start_time(group_id, sid, prev_gameid) or now
+            pending[prev_gameid] = {
+                "quit_time": now,
+                "name": player_name,
+                "game_name": zh_prev_name,
+                "duration_min": max(0, (now - start_time) / 60),
+                "start_time": start_time,
+                "notified": False,
+            }
+            await self._stop_achievement_task(group_id, sid, prev_gameid, final_check=True)
+
+        if current_gameid and current_gameid != prev_gameid:
+            wave = pending.get(current_gameid)
+            if wave and now - int(wave.get("quit_time", 0)) <= 180 and not wave.get("notified"):
+                wave["notified"] = True
+                await self.send_to_targets(group_id, sid, f"{player_name} 游玩 {zh_game_name} 时疑似网络波动。")
+            elif not self._should_skip_game(current_gameid):
+                start_times.setdefault(sid, {})[current_gameid] = now
+                count = await self.api.get_current_player_count(current_gameid)
+                online = f"\n当前在线人数：{count}" if count is not None else ""
+                await self.send_to_targets(
+                    group_id,
+                    sid,
+                    f"【Steam】{player_name} 开始游玩 {zh_game_name}{online}",
+                )
+                await self._start_achievement_task(group_id, sid, current_gameid, player_name, zh_game_name)
+            else:
+                start_times.setdefault(sid, {})[current_gameid] = now
+
+        states[sid] = status.to_json()
+        self._schedule_next_poll(group_id, sid, status)
+        return self._status_line(player_name, status, zh_game_name)
+
+    def _get_start_time(self, group_id: str, sid: str, gameid: str) -> int | None:
+        value = self.group_start_play_times.get(group_id, {}).get(sid)
+        if isinstance(value, dict):
+            found = value.get(gameid)
+            return int(found) if found else None
+        if value:
+            return int(value)
+        return None
+
+    def _schedule_next_poll(
+        self, group_id: str, sid: str, status: PlayerStatus | None
+    ) -> None:
+        interval = self._poll_interval(status)
+        now = int(time.time())
+        interval_min = max(1, interval // 60)
+        next_time = ((now // 60) + math.ceil(interval_min)) * 60
+        self.next_poll_time.setdefault(group_id, {})[sid] = next_time
+
+    def _poll_interval(self, status: PlayerStatus | None) -> int:
+        fixed = int(self.config.get("fixed_poll_interval") or 0)
+        if fixed > 0:
+            return fixed
+        intervals = self._smart_intervals()
+        if not status:
+            return intervals[-1] * 60
+        if status.gameid:
+            return intervals[0] * 60
+        if status.personastate > 0:
+            return intervals[1] * 60
+        if status.lastlogoff:
+            minutes_ago = (int(time.time()) - status.lastlogoff) / 60
+            if minutes_ago <= 12:
+                return intervals[1] * 60
+            if minutes_ago <= 180:
+                return intervals[2] * 60
+            if minutes_ago <= 1440:
+                return intervals[3] * 60
+            if minutes_ago <= 2880:
+                return intervals[4] * 60
+        return intervals[5] * 60
+
+    def _smart_intervals(self) -> list[int]:
+        raw = self.config.get("smart_poll_intervals", "1,3,5,10,20,30")
+        try:
+            values = [int(x.strip()) for x in str(raw).split(",") if x.strip()]
+            if len(values) == 6 and all(v > 0 for v in values):
+                return values
+        except Exception:
+            pass
+        return [1, 3, 5, 10, 20, 30]
+
+    def _status_line(self, name: str, status: PlayerStatus, game_name: str) -> str:
+        if status.gameid:
+            return f"{name} 正在玩 {game_name}"
+        if status.personastate > 0:
+            return f"{name} {PERSONA_TEXT.get(status.personastate, '在线')}"
+        if status.lastlogoff:
+            hours = (int(time.time()) - status.lastlogoff) / 3600
+            return f"{name} 离线，上次在线 {hours:.1f} 小时前"
+        return f"{name} 离线"
+
+    async def _finalize_due_quits(self) -> None:
+        now = int(time.time())
+        changed = False
+        for group_id, by_sid in list(self.group_pending_quit.items()):
+            for sid, by_game in list(by_sid.items()):
+                for gameid, info in list(by_game.items()):
+                    if info.get("notified") or now - int(info.get("quit_time", 0)) < 180:
+                        continue
+                    info["notified"] = True
+                    duration = float(info.get("duration_min") or 0)
+                    self._record_playtime(sid, gameid, info.get("game_name") or "未知游戏", duration)
+                    if self.config.get("enable_game_end_notify", True):
+                        await self.send_to_targets(
+                            group_id,
+                            sid,
+                            (
+                                f"【Steam】{info.get('name', sid)} 结束游玩 "
+                                f"{info.get('game_name', gameid)}\n游玩时间：{self._format_minutes(duration)}"
+                            ),
+                        )
+                    by_game.pop(gameid, None)
+                    changed = True
+                if not by_game:
+                    by_sid.pop(sid, None)
+            if not by_sid:
+                self.group_pending_quit.pop(group_id, None)
+        if changed:
+            self.save_runtime()
+
+    def _record_playtime(self, sid: str, gameid: str, game_name: str, duration_min: float) -> None:
+        if duration_min <= 0 or not gameid:
+            return
+        key = (sid, gameid)
+        now = time.time()
+        if now - self._recorded_quit_cache.get(key, 0) < 300:
+            return
+        self._recorded_quit_cache[key] = now
+        day = self._day_key()
+        self.play_records.setdefault(day, {}).setdefault(sid, {}).setdefault(
+            gameid, {"name": game_name, "minutes": 0}
+        )
+        record = self.play_records[day][sid][gameid]
+        record["name"] = game_name
+        record["minutes"] = int(record.get("minutes") or 0) + int(duration_min)
+
+    def _day_key(self, offset_days: int = 0) -> str:
+        now = datetime.now()
+        if now.hour < 4:
+            now -= timedelta(days=1)
+        now += timedelta(days=offset_days)
+        return now.strftime("%Y-%m-%d")
+
+    def _format_minutes(self, minutes: float) -> str:
+        return f"{minutes:.1f} 分钟" if minutes < 60 else f"{minutes / 60:.1f} 小时"
+
+    def _should_skip_game(self, gameid: str | None) -> bool:
+        if not gameid:
+            return False
+        ids = [x.strip() for x in str(self.config.get("game_filter_ids", "")).split(",") if x.strip()]
+        if not ids:
+            return False
+        mode = self.config.get("game_filter_mode", "全部游戏")
+        if mode == "白名单":
+            return str(gameid) not in ids
+        if mode == "黑名单":
+            return str(gameid) in ids
+        return False
+
+    async def _start_achievement_task(
+        self, group_id: str, sid: str, gameid: str, player_name: str, game_name: str
+    ) -> None:
+        if not self.config.get("enable_achievement_poll", True):
+            return
+        if not self.is_achievement_enabled(group_id) or gameid in self._achievement_blacklist:
+            return
+        key = (group_id, sid, gameid)
+        old = self.achievement_tasks.pop(key, None)
+        if old:
+            old.cancel()
+        snapshot = await self.api.get_player_achievements(sid, gameid)
+        if snapshot is None:
+            self._achievement_blacklist.add(gameid)
+            return
+        self.achievement_snapshots[key] = snapshot
+        task = asyncio.create_task(self._achievement_loop(group_id, sid, gameid, player_name, game_name))
+        self.achievement_tasks[key] = task
+
+    async def _stop_achievement_task(
+        self, group_id: str, sid: str, gameid: str, *, final_check: bool
+    ) -> None:
+        key = (group_id, sid, gameid)
+        task = self.achievement_tasks.pop(key, None)
+        if task:
+            task.cancel()
+        if final_check and key in self.achievement_snapshots:
+            asyncio.create_task(self._achievement_final_check(group_id, sid, gameid))
+        else:
+            self.achievement_snapshots.pop(key, None)
+
+    async def _achievement_loop(
+        self, group_id: str, sid: str, gameid: str, player_name: str, game_name: str
+    ) -> None:
+        try:
+            while True:
+                await asyncio.sleep(1200)
+                await self._check_achievements(group_id, sid, gameid, player_name, game_name)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.warning(f"[steam_status_monitor] 成就轮询异常: {exc}")
+
+    async def _achievement_final_check(self, group_id: str, sid: str, gameid: str) -> None:
+        await asyncio.sleep(300)
+        key = (group_id, sid, gameid)
+        state = self.group_last_states.get(group_id, {}).get(sid, {})
+        player_name = self.display_name(sid, state.get("name") or sid)
+        game_name, _ = await self.api.get_game_names(gameid, state.get("gameextrainfo"))
+        await self._check_achievements(group_id, sid, gameid, player_name, game_name)
+        self.achievement_snapshots.pop(key, None)
+
+    async def _check_achievements(
+        self, group_id: str, sid: str, gameid: str, player_name: str, game_name: str
+    ) -> None:
+        if gameid in self._achievement_blacklist or not self.is_achievement_enabled(group_id):
+            return
+        key = (group_id, sid, gameid)
+        before = self.achievement_snapshots.get(key)
+        after = await self.api.get_player_achievements(sid, gameid)
+        if after is None:
+            return
+        if before is None:
+            self.achievement_snapshots[key] = after
+            return
+        new_items = after - before
+        if not new_items:
+            self.achievement_snapshots[key] = after
+            return
+        names = await self.api.get_achievement_names(gameid)
+        limit = int(self.config.get("max_achievement_notifications", 5))
+        shown = list(new_items)[:limit]
+        lines = [f"【Steam 成就】{player_name} 在 {game_name} 解锁了新成就："]
+        lines.extend(f"- {names.get(item, item)}" for item in shown)
+        if len(new_items) > limit:
+            lines.append(f"另有 {len(new_items) - limit} 个成就。")
+        await self.send_to_targets(group_id, sid, "\n".join(lines))
+        self.achievement_snapshots[key] = after
+
+    async def list_group_status(self, group_id: str) -> str:
+        ids = self.group_steam_ids.get(group_id, [])
+        if not ids:
+            return "本群还没有监控任何 SteamID。"
+        status_map = await self.api.fetch_player_statuses(ids)
+        lines = [f"Steam 状态列表（群 {group_id}）"]
+        for sid in ids:
+            status = status_map.get(sid)
+            if not status:
+                lines.append(f"- {sid}: 获取失败")
+                continue
+            name = self.display_name(sid, status.name)
+            game_name, _ = await self.api.get_game_names(status.gameid, status.gameextrainfo)
+            extra = ""
+            if status.gameid:
+                start = self._get_start_time(group_id, sid, status.gameid)
+                if start:
+                    extra = f"，已玩 {self._format_minutes((time.time() - start) / 60)}"
+            lines.append(f"- {self._status_line(name, status, game_name)}{extra}")
+        return "\n".join(lines)
+
+    async def list_all_status(self) -> str:
+        all_ids: list[str] = []
+        for ids in self.group_steam_ids.values():
+            all_ids.extend(ids)
+        status_map = await self.api.fetch_player_statuses(all_ids)
+        lines = ["Steam 全群状态"]
+        for group_id, ids in self.group_steam_ids.items():
+            lines.append(f"\n群 {group_id}:")
+            for sid in ids:
+                status = status_map.get(sid)
+                if not status:
+                    lines.append(f"- {sid}: 获取失败")
+                    continue
+                name = self.display_name(sid, status.name)
+                game_name, _ = await self.api.get_game_names(status.gameid, status.gameextrainfo)
+                lines.append(f"- {self._status_line(name, status, game_name)}")
+        return "\n".join(lines)
+
+    async def openbox(self, raw_value: str) -> str:
+        sid = await self.api.resolve_steam_input(raw_value)
+        if not sid:
+            return "无法解析为有效 SteamID。"
+        status = await self.api.fetch_player_status(sid)
+        if not status:
+            return f"无法获取 {sid} 的 Steam 状态。"
+        game_name, _ = await self.api.get_game_names(status.gameid, status.gameextrainfo)
+        lines = [
+            f"SteamID: {sid}",
+            f"昵称: {status.name or '-'}",
+            f"状态: {self._status_line(status.name or sid, status, game_name)}",
+            f"当前游戏ID: {status.gameid or '-'}",
+            f"当前游戏: {game_name if status.gameid else '-'}",
+        ]
+        if status.lastlogoff:
+            lines.append(datetime.fromtimestamp(status.lastlogoff).strftime("上次在线: %Y-%m-%d %H:%M:%S"))
+        if status.avatarfull:
+            lines.append(f"头像: {status.avatarfull}")
+        return "\n".join(lines)
+
+    def rank_data(self, days: int, group_id: str | None = None, offset: int = 0) -> list[dict[str, Any]]:
+        base = datetime.strptime(self._day_key(offset), "%Y-%m-%d")
+        date_keys = [(base - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+        if group_id:
+            target = set(self.group_steam_ids.get(group_id, []))
+        else:
+            target = {sid for ids in self.group_steam_ids.values() for sid in ids}
+        merged: dict[str, dict[str, dict[str, Any]]] = {}
+        for day in date_keys:
+            for sid, games in self.play_records.get(day, {}).items():
+                if sid not in target:
+                    continue
+                for gameid, info in games.items():
+                    merged.setdefault(sid, {}).setdefault(
+                        gameid, {"name": info.get("name") or "未知游戏", "minutes": 0}
+                    )
+                    merged[sid][gameid]["minutes"] += int(info.get("minutes") or 0)
+        rows: list[dict[str, Any]] = []
+        for sid, games in merged.items():
+            game_rows = sorted(games.values(), key=lambda x: x["minutes"], reverse=True)
+            total = sum(item["minutes"] for item in game_rows)
+            if total > 0:
+                rows.append({"sid": sid, "total_minutes": total, "games": game_rows})
+        rows.sort(key=lambda x: x["total_minutes"], reverse=True)
+        return rows
+
+    async def rank_text(
+        self, days: int, group_id: str | None = None, label: str = "今日", offset: int = 0
+    ) -> str:
+        rows = self.rank_data(days, group_id, offset)
+        if not rows:
+            return f"暂无{label}游玩记录，游戏结束后才会计入排行榜。"
+        status_map = await self.api.fetch_player_statuses([row["sid"] for row in rows[:20]])
+        lines = [f"Steam 游戏时长排行榜（{label}）"]
+        for idx, row in enumerate(rows[:20], start=1):
+            status = status_map.get(row["sid"])
+            name = self.display_name(row["sid"], status.name if status else row["sid"][-8:])
+            top_games = "、".join(
+                f"{g['name']} {self._format_minutes(g['minutes'])}" for g in row["games"][:3]
+            )
+            lines.append(
+                f"{idx}. {name} - {self._format_minutes(row['total_minutes'])}\n   {top_games}"
+            )
+        return "\n".join(lines)
+
+    async def _maybe_push_daily_rank(self) -> None:
+        now = datetime.now()
+        hour = int(self.config.get("rank_push_hour", 8))
+        minute = int(self.config.get("rank_push_minute", 30))
+        if now.hour != hour or now.minute != minute:
+            return
+        day = self._day_key(-1)
+        if self._last_rank_push_day == day:
+            return
+        groups = list(self.rank_push.get("groups") or [])
+        if not groups:
+            return
+        self._last_rank_push_day = day
+        if self.rank_push.get("all"):
+            text = await self.rank_text(1, None, "昨日", offset=-1)
+            for group_id in groups:
+                await self.send_group_text(group_id, text)
+            return
+        for group_id in groups:
+            text = await self.rank_text(1, group_id, "昨日", offset=-1)
+            await self.send_group_text(group_id, text)
+
+    def config_text(self) -> str:
+        hidden = {"steam_api_key"}
+        lines = ["Steam 状态监控配置："]
+        for key in sorted(self.config):
+            value = "******" if key in hidden and self.config[key] else self.config[key]
+            lines.append(f"{key}: {value}")
+        return "\n".join(lines)
+
+    def set_config_value(self, key: str, value: str) -> str:
+        if key not in self.config:
+            return f"无效配置项：{key}"
+        old = self.config[key]
+        try:
+            if isinstance(old, bool):
+                lowered = value.lower()
+                if lowered in {"true", "1", "yes", "on", "开启"}:
+                    parsed: Any = True
+                elif lowered in {"false", "0", "no", "off", "关闭"}:
+                    parsed = False
+                else:
+                    return "类型错误，应为布尔值。"
+            elif isinstance(old, int):
+                parsed = int(value)
+            elif isinstance(old, float):
+                parsed = float(value)
+            else:
+                parsed = value
+        except Exception:
+            return "配置值类型错误。"
+        self.config[key] = parsed
+        self.save_config_overrides()
+        return f"已设置 {key} = {parsed}"
+
+    async def query_bound_user(self, qq: str, group_id: str) -> str:
+        info = self.bind_data.get(str(qq))
+        if not info:
+            return f"QQ {qq} 未绑定 SteamID。"
+        sid = info.get("sid")
+        if not sid:
+            return f"QQ {qq} 的绑定数据异常。"
+        status = await self.api.fetch_player_status(sid)
+        if not status:
+            return f"无法获取 {sid} 的 Steam 状态。"
+        name = self.display_name(sid, status.name)
+        game_name, _ = await self.api.get_game_names(status.gameid, status.gameextrainfo)
+        extra = ""
+        if status.gameid:
+            start = self._get_start_time(group_id, sid, status.gameid)
+            if start:
+                extra = f"\n已玩：{self._format_minutes((time.time() - start) / 60)}"
+        return self._status_line(name, status, game_name) + extra
+
+    def reset_runtime(self) -> None:
+        self.group_last_states.clear()
+        self.group_start_play_times.clear()
+        self.group_pending_quit.clear()
+        self.next_poll_time.clear()
+        for task in self.achievement_tasks.values():
+            task.cancel()
+        self.achievement_tasks.clear()
+        self.achievement_snapshots.clear()
+        self.save_runtime()
+
+    async def shutdown(self) -> None:
+        for task in self.achievement_tasks.values():
+            task.cancel()
+        self.achievement_tasks.clear()
+        self.save_runtime()
+
