@@ -170,7 +170,7 @@ class SteamStatusService:
 
     async def add_steam_ids(
         self, group_id: str, raw_values: list[str], qq: str | None = None, nickname: str | None = None
-    ) -> tuple[list[str], list[str], list[str]]:
+    ) -> tuple[list[str], list[str], list[str], list[str]]:
         resolved: list[str] = []
         invalid: list[str] = []
         for raw in raw_values:
@@ -183,41 +183,66 @@ class SteamStatusService:
 
         ids = self.group_steam_ids.setdefault(group_id, [])
         added: list[str] = []
+        linked: list[str] = []
         already: list[str] = []
         limit = int(self.config.get("max_group_size", 20))
         for sid in resolved:
             if sid in ids:
                 already.append(sid)
-            elif len(ids) < limit:
+                continue
+
+            owner_groups = [
+                gid for gid, group_ids in self.group_steam_ids.items()
+                if gid != group_id and sid in group_ids
+            ]
+            if owner_groups:
+                push_ids = self.push_groups.setdefault(sid, [])
+                if group_id not in push_ids:
+                    push_ids.append(group_id)
+                    linked.append(sid)
+                else:
+                    already.append(sid)
+                continue
+
+            if len(ids) < limit:
                 ids.append(sid)
                 added.append(sid)
+
         if qq and resolved:
             for sid in resolved:
                 self.bind_qq(qq, sid, nickname)
         self.save_static()
-        return added, already, invalid
+        return added, linked, already, invalid
 
     async def delete_steam_id(self, group_id: str, raw_value: str) -> tuple[bool, str]:
         sid = await self.api.resolve_steam_input(raw_value)
         if not sid:
             return False, "无法解析为有效 SteamID。"
         ids = self.group_steam_ids.get(group_id, [])
-        if sid not in ids:
-            return False, f"SteamID {sid} 不在群 {group_id} 的监控列表中。"
-        ids.remove(sid)
-        self.group_steam_ids[group_id] = ids
-        for qq, info in list(self.bind_data.items()):
-            if info.get("sid") == sid:
-                self.bind_data.pop(qq, None)
-        self.save_static()
-        return True, sid
+        if sid in ids:
+            ids.remove(sid)
+            self.group_steam_ids[group_id] = ids
+            for qq, info in list(self.bind_data.items()):
+                if info.get("sid") == sid:
+                    self.bind_data.pop(qq, None)
+            self.save_static()
+            return True, f"已删除本群主监控：{sid}"
+
+        if sid in self.push_groups and group_id in self.push_groups[sid]:
+            self.push_groups[sid].remove(group_id)
+            if not self.push_groups[sid]:
+                self.push_groups.pop(sid, None)
+            self.save_static()
+            return True, f"已取消本群联动推送：{sid}"
+
+        return False, f"SteamID {sid} 不在群 {group_id} 的主监控或联动推送中。"
 
     async def start_group(self, group_id: str, bot: Bot) -> str:
         if not self.config.get("steam_api_key"):
             return "未配置 steam_api_key，请先在 .env 或 /steam set steam_api_key 中配置。"
         ids = self.group_steam_ids.get(group_id, [])
         if not ids:
-            return "本群还没有监控任何 SteamID，请先使用 /steam addid 添加。"
+            return "本群还没有监控任何 SteamID，请先使用 /steam add 添加。"
 
         self.remember_bot(group_id, bot)
         self.set_group_enabled(group_id, True)
@@ -326,12 +351,10 @@ class SteamStatusService:
                 await self.send_to_targets(group_id, sid, f"{player_name} 游玩 {zh_game_name} 时疑似网络波动。")
             elif not self._should_skip_game(current_gameid):
                 start_times.setdefault(sid, {})[current_gameid] = now
-                count = await self.api.get_current_player_count(current_gameid)
-                online = f"\n当前在线人数：{count}" if count is not None else ""
                 await self.send_to_targets(
                     group_id,
                     sid,
-                    f"【Steam】{player_name} 开始游玩 {zh_game_name}{online}",
+                    f"【Steam】{player_name} 开始游玩 {zh_game_name}",
                 )
                 await self._start_achievement_task(group_id, sid, current_gameid, player_name, zh_game_name)
             else:
@@ -568,24 +591,6 @@ class SteamStatusService:
                 if start:
                     extra = f"，已玩 {self._format_minutes((time.time() - start) / 60)}"
             lines.append(f"- {self._status_line(name, status, game_name)}{extra}")
-        return "\n".join(lines)
-
-    async def list_all_status(self) -> str:
-        all_ids: list[str] = []
-        for ids in self.group_steam_ids.values():
-            all_ids.extend(ids)
-        status_map = await self.api.fetch_player_statuses(all_ids)
-        lines = ["Steam 全群状态"]
-        for group_id, ids in self.group_steam_ids.items():
-            lines.append(f"\n群 {group_id}:")
-            for sid in ids:
-                status = status_map.get(sid)
-                if not status:
-                    lines.append(f"- {sid}: 获取失败")
-                    continue
-                name = self.display_name(sid, status.name)
-                game_name, _ = await self.api.get_game_names(status.gameid, status.gameextrainfo)
-                lines.append(f"- {self._status_line(name, status, game_name)}")
         return "\n".join(lines)
 
     async def openbox(self, raw_value: str) -> str:

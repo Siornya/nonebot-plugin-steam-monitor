@@ -22,7 +22,7 @@ class JsonStore:
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:
-            logger.warning(f"[steam_status_monitor] 读取 {path} 失败: {exc}")
+            logger.warning(f"[steam-monitor] 读取 {path} 失败: {exc}")
             return default
 
     def save(self, name: str, data: Any) -> None:
@@ -34,5 +34,5 @@ class JsonStore:
                 encoding="utf-8",
             )
         except Exception as exc:
-            logger.warning(f"[steam_status_monitor] 写入 {path} 失败: {exc}")
+            logger.warning(f"[steam-monitor] 写入 {path} 失败: {exc}")
 

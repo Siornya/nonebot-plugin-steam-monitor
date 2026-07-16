@@ -199,22 +199,6 @@ class SteamApi:
         self._game_name_cache[key] = (zh, en)
         return zh, en
 
-    async def get_current_player_count(self, appid: str | int | None) -> int | None:
-        if not appid:
-            return None
-        try:
-            async with self._client(timeout=10) as client:
-                resp = await client.get(
-                    f"{self.api_base}/ISteamUserStats/GetNumberOfCurrentPlayers/v1/",
-                    params={"appid": str(appid)},
-                )
-                resp.raise_for_status()
-                data = resp.json()
-            return (data.get("response") or {}).get("player_count")
-        except Exception as exc:
-            logger.warning(f"[steam_status_monitor] 获取在线人数失败 appid={appid}: {exc}")
-            return None
-
     async def get_player_achievements(self, steamid: str, appid: str | int) -> set[str] | None:
         if not self.api_key or not steamid or not appid:
             return None
