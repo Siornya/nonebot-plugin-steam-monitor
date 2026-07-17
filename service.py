@@ -4,13 +4,12 @@ import asyncio
 import math
 import time
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 from nonebot import get_bots, get_driver, logger
 from nonebot.adapters.onebot.v11 import Bot, MessageSegment
 
-from .config import Config, dump_config
+from .config import Config, DATA_DIR, dump_config
 from .steam_api import PlayerStatus, SteamApi
 from .storage import JsonStore
 
@@ -28,7 +27,7 @@ PERSONA_TEXT = {
 
 class SteamStatusService:
     def __init__(self, config: Config):
-        self.store = JsonStore(Path.cwd() / "data" / "steam_status_monitor")
+        self.store = JsonStore(DATA_DIR)
         self.config = dump_config(config)
         self.config.update(self.store.load("config_overrides.json", {}))
 
@@ -347,8 +346,7 @@ class SteamStatusService:
         if current_gameid and current_gameid != prev_gameid:
             wave = pending.get(current_gameid)
             if wave and now - int(wave.get("quit_time", 0)) <= 180 and not wave.get("notified"):
-                wave["notified"] = True
-                await self.send_to_targets(group_id, sid, f"{player_name} 游玩 {zh_game_name} 时疑似网络波动。")
+                pending.pop(current_gameid, None)
             elif not self._should_skip_game(current_gameid):
                 start_times.setdefault(sid, {})[current_gameid] = now
                 await self.send_to_targets(

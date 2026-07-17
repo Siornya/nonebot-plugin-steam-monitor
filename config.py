@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+from nonebot import require
 from pydantic import BaseModel
+
+require("nonebot_plugin_localstore")
+import nonebot_plugin_localstore as store  # noqa: E402
 
 
 class Config(BaseModel):
@@ -27,6 +33,13 @@ class Config(BaseModel):
     permission_level: int = 2
     game_filter_mode: str = "全部游戏"
     game_filter_ids: str = ""
+
+
+PLUGIN_DIR = Path(__file__).parent
+RESOURCE_DIR = PLUGIN_DIR / "resources"
+
+DATA_DIR = store.get_data_dir("steam-monitor")
+CACHE_DIR = store.get_cache_dir("steam-monitor")
 
 
 def dump_config(config: Config) -> dict:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 import shutil
-from pathlib import Path
 from typing import Annotated
 
 from nonebot import get_driver, get_plugin_config, logger, on_command, require
@@ -12,7 +11,7 @@ from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
 
-from .config import Config
+from .config import CACHE_DIR, Config
 from .service import SteamStatusService
 
 require("nonebot_plugin_apscheduler")
@@ -271,10 +270,9 @@ async def _(event: MessageEvent, args: Annotated[Message, CommandArg()]) -> None
 
 @clear_cache_cmd.handle()
 async def _() -> None:
-    root = Path.cwd() / "data" / "steam_status_monitor"
     cleared: list[str] = []
     for name in ("avatars", "covers", "covers_v", "images"):
-        path = root / name
+        path = CACHE_DIR / name
         if path.exists():
             shutil.rmtree(path)
             cleared.append(str(path))
