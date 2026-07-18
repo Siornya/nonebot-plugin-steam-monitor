@@ -326,11 +326,12 @@ class SteamStatusService:
             self._schedule_next_poll(group_id, sid, status)
             return self._status_line(player_name, status, zh_game_name)
 
+        ended_games: list[tuple[str, float]] = []
         if prev_gameid and prev_gameid != current_gameid:
             prev_name = prev.get("gameextrainfo") or "未知游戏"
             zh_prev_name, _ = await self.api.get_game_names(prev_gameid, prev_name)
             start_time = self._get_start_time(group_id, sid, prev_gameid) or now
-            pending[prev_gameid] = {
+            quit_info = {
                 "quit_time": now,
                 "name": player_name,
                 "game_name": zh_prev_name,
@@ -339,21 +340,30 @@ class SteamStatusService:
                 "notified": False,
             }
             await self._stop_achievement_task(group_id, sid, prev_gameid, final_check=True)
+            if current_gameid:
+                ended_games.append(self._record_quit(sid, prev_gameid, quit_info))
+            else:
+                pending[prev_gameid] = quit_info
 
         if current_gameid and current_gameid != prev_gameid:
             wave = pending.get(current_gameid)
             if wave and now - int(wave.get("quit_time", 0)) <= 180 and not wave.get("notified"):
                 pending.pop(current_gameid, None)
-            elif not self._should_skip_game(current_gameid):
-                start_times.setdefault(sid, {})[current_gameid] = now
-                await self.send_to_targets(
-                    group_id,
-                    sid,
-                    f"【Steam】{player_name} 开始游玩 {zh_game_name}",
-                )
-                await self._start_achievement_task(group_id, sid, current_gameid, player_name, zh_game_name)
             else:
+                for pending_gameid, info in list(pending.items()):
+                    if not info.get("notified"):
+                        ended_games.append(self._record_quit(sid, pending_gameid, info))
+                    pending.pop(pending_gameid, None)
                 start_times.setdefault(sid, {})[current_gameid] = now
+                if not self._should_skip_game(current_gameid):
+                    if ended_games and self.config.get("enable_game_end_notify", True):
+                        await self._send_switch_message(group_id, sid, player_name, ended_games, zh_game_name)
+                    else:
+                        await self._send_start_message(group_id, sid, player_name, zh_game_name)
+                    await self._start_achievement_task(group_id, sid, current_gameid, player_name, zh_game_name)
+                elif ended_games and self.config.get("enable_game_end_notify", True):
+                    for game_name, duration in ended_games:
+                        await self._send_end_message(group_id, sid, player_name, game_name, duration)
 
         states[sid] = status.to_json()
         self._schedule_next_poll(group_id, sid, status)
@@ -420,6 +430,49 @@ class SteamStatusService:
             return f"{name} 离线，上次在线 {hours:.1f} 小时前"
         return f"{name} 离线"
 
+    def _record_quit(self, sid: str, gameid: str, info: dict[str, Any]) -> tuple[str, float]:
+        info["notified"] = True
+        duration = float(info.get("duration_min") or 0)
+        game_name = info.get("game_name") or "未知游戏"
+        self._record_playtime(sid, gameid, game_name, duration)
+        return game_name, duration
+
+    async def _send_start_message(
+        self, group_id: str, sid: str, player_name: str, game_name: str
+    ) -> None:
+        await self.send_to_targets(group_id, sid, f"【Steam】{player_name} 开始玩 {game_name}")
+
+    async def _send_end_message(
+        self, group_id: str, sid: str, player_name: str, game_name: str, duration: float
+    ) -> None:
+        await self.send_to_targets(
+            group_id,
+            sid,
+            f"【Steam】{player_name} 结束了 {game_name}\n游玩时间：{self._format_minutes(duration)}",
+        )
+
+    async def _send_switch_message(
+        self,
+        group_id: str,
+        sid: str,
+        player_name: str,
+        ended_games: list[tuple[str, float]],
+        new_game_name: str,
+    ) -> None:
+        ended_names = "、".join(game_name for game_name, _ in ended_games)
+        lines = [f"【Steam】{player_name} 结束了 {ended_names} 并开始玩 {new_game_name}"]
+        for game_name, duration in ended_games:
+            lines.append(f"{game_name} 游玩时间：{self._format_minutes(duration)}")
+        await self.send_to_targets(group_id, sid, "\n".join(lines))
+
+    async def _finalize_quit(
+        self, group_id: str, sid: str, gameid: str, info: dict[str, Any]
+    ) -> None:
+        player_name = info.get("name", sid)
+        game_name, duration = self._record_quit(sid, gameid, info)
+        if self.config.get("enable_game_end_notify", True):
+            await self._send_end_message(group_id, sid, player_name, game_name, duration)
+
     async def _finalize_due_quits(self) -> None:
         now = int(time.time())
         changed = False
@@ -428,18 +481,7 @@ class SteamStatusService:
                 for gameid, info in list(by_game.items()):
                     if info.get("notified") or now - int(info.get("quit_time", 0)) < 180:
                         continue
-                    info["notified"] = True
-                    duration = float(info.get("duration_min") or 0)
-                    self._record_playtime(sid, gameid, info.get("game_name") or "未知游戏", duration)
-                    if self.config.get("enable_game_end_notify", True):
-                        await self.send_to_targets(
-                            group_id,
-                            sid,
-                            (
-                                f"【Steam】{info.get('name', sid)} 结束游玩 "
-                                f"{info.get('game_name', gameid)}\n游玩时间：{self._format_minutes(duration)}"
-                            ),
-                        )
+                    await self._finalize_quit(group_id, sid, gameid, info)
                     by_game.pop(gameid, None)
                     changed = True
                 if not by_game:
