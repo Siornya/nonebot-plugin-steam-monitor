@@ -168,7 +168,7 @@ class SteamStatusService:
         self.save_static()
 
     async def add_steam_ids(
-        self, group_id: str, raw_values: list[str], qq: str | None = None, nickname: str | None = None
+        self, group_id: str, raw_values: list[str]
     ) -> tuple[list[str], list[str], list[str], list[str]]:
         resolved: list[str] = []
         invalid: list[str] = []
@@ -207,9 +207,6 @@ class SteamStatusService:
                 ids.append(sid)
                 added.append(sid)
 
-        if qq and resolved:
-            for sid in resolved:
-                self.bind_qq(qq, sid, nickname)
         self.save_static()
         return added, linked, already, invalid
 

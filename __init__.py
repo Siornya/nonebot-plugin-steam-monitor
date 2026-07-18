@@ -37,7 +37,7 @@ steam_superuser_cmd = on_command("steam", aliases={"Steam"}, permission=SUPERUSE
 steamwho_cmd = on_command("steamwho", aliases={"在干嘛"}, priority=5, block=True)
 clear_cache_cmd = on_command("steam清除缓存", permission=SUPERUSER, priority=5, block=True)
 
-PUBLIC_COMMANDS = {"help", "帮助", "list", "openbox", "rank", "config"}
+PUBLIC_COMMANDS = {"help", "帮助", "list", "openbox", "rank", "config", "bind"}
 ADMIN_COMMANDS = {"on", "off", "add", "rm", "rank_on", "achievement_on", "achievement_off", "set", "rs", "clear", "clear_allgroup"}
 
 def _group_id(event: MessageEvent) -> str:
@@ -53,6 +53,25 @@ def _is_superuser(event: MessageEvent) -> bool:
 def _text_args(args: Message) -> list[str]:
     text = str(args).strip()
     return text.split() if text else []
+
+
+def _arg_body(args: Message) -> str:
+    text = str(args).strip()
+    return text.split(maxsplit=1)[1].strip() if " " in text else ""
+
+
+def _split_steam_inputs(raw: str) -> list[str]:
+    return [item.strip() for item in re.split(r"[\s,，]+", raw) if item.strip()]
+
+
+def _parse_rm_inputs(parts: list[str], group_id: str) -> tuple[list[str], str]:
+    values = _split_steam_inputs(" ".join(parts[1:]))
+    if len(values) >= 2:
+        maybe_group = values[-1]
+        known_groups = set(service.group_steam_ids) | set(service.group_flags) | set(service.notify_bots)
+        if maybe_group in known_groups:
+            return values[:-1], maybe_group
+    return values, group_id
 
 
 def _extract_at_qq(args: Message) -> str | None:
@@ -82,8 +101,9 @@ def _parse_period(raw: str | None) -> tuple[int, str]:
 HELP_TEXT = """Steam 状态监控指令：
 /steam on - 启动本群监控
 /steam off - 停止本群监控
-/steam add [SteamID/链接/好友码] [@用户] [备注名] - 添加监控；若已在别群监控则自动加入联动推送
-/steam rm [SteamID/链接/好友码] [群号] - 删除监控
+/steam add [SteamID/链接/好友码...] - 添加监控；若已在别群监控则自动加入联动推送
+/steam rm [SteamID/链接/好友码...] - 删除本群监控或联动推送
+/steam bind [SteamID/链接/好友码] - 绑定自己的 QQ 与 SteamID
 /steam list - 查看本群玩家状态
 /steam openbox [SteamID/链接/好友码] - 查看玩家详情
 /steam rank [天数|week|month] - 本群排行榜
@@ -124,6 +144,17 @@ async def _handle_public_command(
     if sub == "config":
         await matcher.finish(service.config_text())
 
+    if sub == "bind":
+        raw_ids = _split_steam_inputs(" ".join(parts[1:]))
+        if not raw_ids:
+            await matcher.finish("用法：/steam bind [SteamID/链接/好友码]")
+        sid = await service.api.resolve_steam_input(raw_ids[0])
+        if not sid:
+            await matcher.finish("无法解析为有效 SteamID。")
+        qq = event.get_user_id()
+        service.bind_qq(qq, sid)
+        await matcher.finish(f"已绑定你的 QQ {qq} -> SteamID {sid}")
+
 
 async def _handle_admin_command(
     matcher: Matcher,
@@ -142,15 +173,10 @@ async def _handle_admin_command(
         await matcher.finish(service.stop_group(group_id))
 
     if sub == "add":
-        if len(parts) < 2:
-            await matcher.finish("用法：/steam add [SteamID/链接/好友码] [@用户] [备注名]")
-        raw_ids = [x.strip() for x in re.split(r"[,，]+", parts[1]) if x.strip()]
-        qq = _extract_at_qq(args)
-        nickname = None
-        if len(parts) >= 3:
-            tail = re.sub(r"\[CQ:at,qq=\d+\]", "", " ".join(parts[2:])).strip()
-            nickname = tail or None
-        added, linked, already, invalid = await service.add_steam_ids(group_id, raw_ids, qq, nickname)
+        raw_ids = _split_steam_inputs(_arg_body(args))
+        if not raw_ids:
+            await matcher.finish("用法：/steam add [SteamID/链接/好友码...]")
+        added, linked, already, invalid = await service.add_steam_ids(group_id, raw_ids)
         if linked:
             service.remember_bot(group_id, bot)
 
@@ -163,16 +189,15 @@ async def _handle_admin_command(
             lines.append("已存在：" + ", ".join(already))
         if invalid:
             lines.append("无法解析：" + ", ".join(invalid))
-        if qq and (added or linked):
-            lines.append(f"已绑定 QQ {qq}。")
         await matcher.finish("\n".join(lines) if lines else "未添加任何 SteamID。")
 
     if sub == "rm":
-        if len(parts) < 2:
-            await matcher.finish("用法：/steam rm [SteamID/链接/好友码] [群号]")
-        target_group = parts[2] if len(parts) >= 3 else group_id
-        _, msg = await service.delete_steam_id(target_group, parts[1])
-        await matcher.finish(msg)
+        raw_ids, target_group = _parse_rm_inputs(parts, group_id)
+        if not raw_ids:
+            await matcher.finish("用法：/steam rm [SteamID/链接/好友码...]")
+        results = [await service.delete_steam_id(target_group, raw) for raw in raw_ids]
+        lines = [msg for _, msg in results]
+        await matcher.finish("\n".join(lines))
 
     if sub == "rank_on":
         param = parts[1].lower() if len(parts) >= 2 else ""
