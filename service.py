@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import math
 import time
 from datetime import datetime, timedelta
@@ -9,7 +11,8 @@ from typing import Any
 from nonebot import get_bots, get_driver, logger
 from nonebot.adapters.onebot.v11 import Bot, MessageSegment
 
-from .config import Config, DATA_DIR, dump_config
+from .config import CACHE_DIR, Config, DATA_DIR, dump_config
+from .renderer import render_status_image
 from .steam_api import PlayerStatus, SteamApi
 from .storage import JsonStore
 
@@ -122,9 +125,7 @@ class SteamStatusService:
         self.group_flags.setdefault(group_id, {})["achievement"] = enabled
         self.save_static()
 
-    async def send_group_text(self, group_id: str, text: str) -> bool:
-        if not text:
-            return False
+    def _get_push_bot(self, group_id: str) -> Bot | None:
         bots = get_bots()
         bot_id = self.notify_bots.get(group_id)
         bot = bots.get(bot_id) if bot_id else None
@@ -132,12 +133,36 @@ class SteamStatusService:
             bot = next(iter(bots.values()))
         if not bot:
             logger.warning(f"[steam_status_monitor] 无可用 Bot，无法推送群 {group_id}")
+        return bot
+
+    async def send_group_text(self, group_id: str, text: str) -> bool:
+        if not text:
+            return False
+        bot = self._get_push_bot(group_id)
+        if not bot:
             return False
         try:
             await bot.send_group_msg(group_id=int(group_id), message=MessageSegment.text(text))
             return True
         except Exception as exc:
-            logger.warning(f"[steam_status_monitor] 推送群 {group_id} 失败: {exc}")
+            logger.warning(f"[steam_status_monitor] 推送群 {group_id} 文本失败: {exc}")
+            return False
+
+    async def send_group_image(self, group_id: str, image: bytes) -> bool:
+        if not image:
+            return False
+        bot = self._get_push_bot(group_id)
+        if not bot:
+            return False
+        try:
+            image_b64 = base64.b64encode(image).decode()
+            await bot.send_group_msg(
+                group_id=int(group_id),
+                message=MessageSegment.image(f"base64://{image_b64}"),
+            )
+            return True
+        except Exception as exc:
+            logger.warning(f"[steam_status_monitor] 推送群 {group_id} 图片失败: {exc}")
             return False
 
     def remember_bot(self, group_id: str, bot: Bot) -> None:
@@ -154,6 +179,12 @@ class SteamStatusService:
     async def send_to_targets(self, group_id: str, sid: str, text: str) -> None:
         for target in self._target_groups(group_id, sid):
             await self.send_group_text(target, text)
+
+    async def send_image_to_targets(self, group_id: str, sid: str, image: bytes) -> bool:
+        ok = False
+        for target in self._target_groups(group_id, sid):
+            ok = await self.send_group_image(target, image) or ok
+        return ok
 
     def display_name(self, sid: str, steam_name: str | None = None) -> str:
         for info in self.bind_data.values():
@@ -337,6 +368,8 @@ class SteamStatusService:
                 "game_name": zh_prev_name,
                 "duration_min": max(0, (now - start_time) / 60),
                 "start_time": start_time,
+                "avatar_url": prev.get("avatarfull") or prev.get("avatar"),
+                "gameid": prev_gameid,
                 "notified": False,
             }
             await self._stop_achievement_task(group_id, sid, prev_gameid, final_check=True)
@@ -357,13 +390,35 @@ class SteamStatusService:
                 start_times.setdefault(sid, {})[current_gameid] = now
                 if not self._should_skip_game(current_gameid):
                     if ended_games and self.config.get("enable_game_end_notify", True):
-                        await self._send_switch_message(group_id, sid, player_name, ended_games, zh_game_name)
+                        await self._send_switch_message(
+                            group_id,
+                            sid,
+                            player_name,
+                            ended_games,
+                            zh_game_name,
+                            avatar_url=status.avatarfull or status.avatar,
+                            new_gameid=current_gameid,
+                        )
                     else:
-                        await self._send_start_message(group_id, sid, player_name, zh_game_name)
+                        await self._send_start_message(
+                            group_id,
+                            sid,
+                            player_name,
+                            zh_game_name,
+                            avatar_url=status.avatarfull or status.avatar,
+                            gameid=current_gameid,
+                        )
                     await self._start_achievement_task(group_id, sid, current_gameid, player_name, zh_game_name)
                 elif ended_games and self.config.get("enable_game_end_notify", True):
                     for game_name, duration in ended_games:
-                        await self._send_end_message(group_id, sid, player_name, game_name, duration)
+                        await self._send_end_message(
+                            group_id,
+                            sid,
+                            player_name,
+                            game_name,
+                            duration,
+                            avatar_url=status.avatarfull or status.avatar,
+                        )
 
         states[sid] = status.to_json()
         self._schedule_next_poll(group_id, sid, status)
@@ -437,18 +492,78 @@ class SteamStatusService:
         self._record_playtime(sid, gameid, game_name, duration)
         return game_name, duration
 
-    async def _send_start_message(
-        self, group_id: str, sid: str, player_name: str, game_name: str
-    ) -> None:
-        await self.send_to_targets(group_id, sid, f"【Steam】{player_name} 开始玩 {game_name}")
+    async def _send_status_image(self, group_id: str, sid: str, **kwargs: Any) -> None:
+        try:
+            image = render_status_image(**kwargs)
+        except Exception as exc:
+            logger.warning(f"[steam_status_monitor] 渲染状态图片失败: {exc}")
+            return
+        if not await self.send_image_to_targets(group_id, sid, image):
+            logger.warning(f"[steam_status_monitor] 状态图片未成功推送到任何目标群 sid={sid}")
 
-    async def _send_end_message(
-        self, group_id: str, sid: str, player_name: str, game_name: str, duration: float
+    async def _cached_image(self, cache_type: str, key: str, url: str | None) -> bytes | None:
+        if not url:
+            return None
+        digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
+        suffix = url.rsplit(".", 1)[-1].split("?", 1)[0].lower()
+        if suffix not in {"jpg", "jpeg", "png", "webp"}:
+            suffix = "img"
+        path = CACHE_DIR / "images" / cache_type / f"{key}_{digest}.{suffix}"
+        if path.exists():
+            return path.read_bytes()
+        data = await self.api.download_image(url)
+        if not data:
+            return None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return data
+
+    async def _send_start_message(
+        self,
+        group_id: str,
+        sid: str,
+        player_name: str,
+        game_name: str,
+        *,
+        avatar_url: str | None = None,
+        gameid: str | None = None,
     ) -> None:
-        await self.send_to_targets(
+        avatar_image = await self._cached_image("avatars", sid, avatar_url)
+        game_logo_image = await self._cached_image("game_headers", gameid or "unknown", self.api.get_game_header_url(gameid))
+        await self._send_status_image(
             group_id,
             sid,
-            f"【Steam】{player_name} 结束了 {game_name}\n游玩时间：{self._format_minutes(duration)}",
+            kind="start",
+            player_name=player_name,
+            game_name=game_name,
+            avatar_image=avatar_image,
+            game_logo_image=game_logo_image,
+        )
+
+    async def _send_end_message(
+        self,
+        group_id: str,
+        sid: str,
+        player_name: str,
+        game_name: str,
+        duration: float,
+        *,
+        avatar_url: str | None = None,
+        gameid: str | None = None,
+    ) -> None:
+        avatar_image = await self._cached_image("avatars", sid, avatar_url)
+        game_logo_image = await self._cached_image(
+            "game_headers", gameid or "unknown", self.api.get_game_header_url(gameid)
+        )
+        await self._send_status_image(
+            group_id,
+            sid,
+            kind="end",
+            player_name=player_name,
+            game_name=game_name,
+            duration_min=duration,
+            avatar_image=avatar_image,
+            game_logo_image=game_logo_image,
         )
 
     async def _send_switch_message(
@@ -458,12 +573,24 @@ class SteamStatusService:
         player_name: str,
         ended_games: list[tuple[str, float]],
         new_game_name: str,
+        *,
+        avatar_url: str | None = None,
+        new_gameid: str | None = None,
     ) -> None:
-        ended_names = "、".join(game_name for game_name, _ in ended_games)
-        lines = [f"【Steam】{player_name} 结束了 {ended_names} 并开始玩 {new_game_name}"]
-        for game_name, duration in ended_games:
-            lines.append(f"{game_name} 游玩时间：{self._format_minutes(duration)}")
-        await self.send_to_targets(group_id, sid, "\n".join(lines))
+        avatar_image = await self._cached_image("avatars", sid, avatar_url)
+        game_logo_image = await self._cached_image(
+            "game_headers", new_gameid or "unknown", self.api.get_game_header_url(new_gameid)
+        )
+        await self._send_status_image(
+            group_id,
+            sid,
+            kind="switch",
+            player_name=player_name,
+            new_game_name=new_game_name,
+            ended_games=ended_games,
+            avatar_image=avatar_image,
+            game_logo_image=game_logo_image,
+        )
 
     async def _finalize_quit(
         self, group_id: str, sid: str, gameid: str, info: dict[str, Any]
@@ -471,7 +598,15 @@ class SteamStatusService:
         player_name = info.get("name", sid)
         game_name, duration = self._record_quit(sid, gameid, info)
         if self.config.get("enable_game_end_notify", True):
-            await self._send_end_message(group_id, sid, player_name, game_name, duration)
+            await self._send_end_message(
+                group_id,
+                sid,
+                player_name,
+                game_name,
+                duration,
+                avatar_url=info.get("avatar_url"),
+                gameid=gameid,
+            )
 
     async def _finalize_due_quits(self) -> None:
         now = int(time.time())

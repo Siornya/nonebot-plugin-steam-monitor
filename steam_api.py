@@ -199,6 +199,26 @@ class SteamApi:
         self._game_name_cache[key] = (zh, en)
         return zh, en
 
+    async def download_image(self, url: str) -> bytes | None:
+        if not url:
+            return None
+        try:
+            async with self._client(timeout=15) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                content_type = resp.headers.get("content-type", "")
+                if "image" not in content_type.lower():
+                    return None
+                return resp.content
+        except Exception as exc:
+            logger.warning(f"[steam_status_monitor] 下载图片失败 {url}: {exc}")
+            return None
+
+    def get_game_header_url(self, appid: str | int | None) -> str | None:
+        if not appid:
+            return None
+        return f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg"
+
     async def get_player_achievements(self, steamid: str, appid: str | int) -> set[str] | None:
         if not self.api_key or not steamid or not appid:
             return None
