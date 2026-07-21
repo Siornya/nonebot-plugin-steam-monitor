@@ -13,6 +13,7 @@ class Config(BaseModel):
     steam_api_key: str = ""
     steam_api_base: str = "https://api.steampowered.com"
     steam_store_base: str = "https://store.steampowered.com"
+    sgdb_api_key: str = ""
 
     fixed_poll_interval: int = 0
     smart_poll_intervals: str = "1,3,5,10,20,30"

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 from nonebot import logger
@@ -65,6 +65,7 @@ class SteamApi:
         self.retry_times = max(1, retry_times)
         self.proxy = proxy
         self._game_name_cache: dict[str, tuple[str, str]] = {}
+        self._sgdb_cover_cache: dict[tuple[str, str], str | None] = {}
 
     def update(
         self,
@@ -214,10 +215,77 @@ class SteamApi:
             logger.warning(f"[steam_status_monitor] 下载图片失败 {url}: {exc}")
             return None
 
-    def get_game_header_url(self, appid: str | int | None) -> str | None:
-        if not appid:
+    async def get_sgdb_vertical_cover_url(
+        self,
+        game_name: str,
+        sgdb_api_key: str | None,
+        *,
+        appid: str | int | None = None,
+        sgdb_game_name: str | None = None,
+    ) -> str | None:
+        if not sgdb_api_key:
             return None
-        return f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg"
+
+        search_name = (sgdb_game_name or game_name or "").strip()
+        cache_key = (str(appid or ""), search_name)
+        if cache_key in self._sgdb_cover_cache:
+            return self._sgdb_cover_cache[cache_key]
+
+        headers = {"Authorization": f"Bearer {sgdb_api_key}"}
+        async with self._client(timeout=10) as client:
+            try:
+                cover_url = await self._find_sgdb_cover_by_name(client, headers, search_name)
+                if cover_url:
+                    self._sgdb_cover_cache[cache_key] = cover_url
+                    return cover_url
+
+                if appid:
+                    game_url = f"https://www.steamgriddb.com/api/v2/games/steam/{appid}"
+                    resp = await client.get(game_url, headers=headers)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    sgdb_name = (data.get("data") or {}).get("name") if data.get("success") else None
+                    if sgdb_name:
+                        cover_url = await self._find_sgdb_cover_by_name(client, headers, str(sgdb_name))
+                        if cover_url:
+                            self._sgdb_cover_cache[cache_key] = cover_url
+                            return cover_url
+            except Exception as exc:
+                logger.warning(
+                    f"[steam_status_monitor] 获取 SGDB 竖版封面失败 appid={appid} name={search_name}: {exc}"
+                )
+
+        self._sgdb_cover_cache[cache_key] = None
+        return None
+
+    async def _find_sgdb_cover_by_name(
+        self, client: httpx.AsyncClient, headers: dict[str, str], game_name: str
+    ) -> str | None:
+        if not game_name:
+            return None
+        search_url = (
+            "https://www.steamgriddb.com/api/v2/search/autocomplete/"
+            f"{quote(game_name, safe='')}"
+        )
+        resp = await client.get(search_url, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("success") or not data.get("data"):
+            return None
+
+        sgdb_game_id = data["data"][0].get("id")
+        if not sgdb_game_id:
+            return None
+        grid_url = (
+            f"https://www.steamgriddb.com/api/v2/grids/game/{sgdb_game_id}"
+            "?dimensions=600x900&type=static&limit=1"
+        )
+        resp = await client.get(grid_url, headers=headers)
+        resp.raise_for_status()
+        grid_data = resp.json()
+        if not grid_data.get("success") or not grid_data.get("data"):
+            return None
+        return grid_data["data"][0].get("url")
 
     async def get_player_achievements(self, steamid: str, appid: str | int) -> set[str] | None:
         if not self.api_key or not steamid or not appid:

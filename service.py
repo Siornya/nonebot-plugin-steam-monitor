@@ -518,6 +518,14 @@ class SteamStatusService:
         path.write_bytes(data)
         return data
 
+    async def _game_cover_image(self, gameid: str | None, game_name: str) -> bytes | None:
+        cover_url = await self.api.get_sgdb_vertical_cover_url(
+            game_name,
+            self.config.get("sgdb_api_key"),
+            appid=gameid,
+        )
+        return await self._cached_image("game_covers_v", gameid or "unknown", cover_url)
+
     async def _send_start_message(
         self,
         group_id: str,
@@ -529,7 +537,7 @@ class SteamStatusService:
         gameid: str | None = None,
     ) -> None:
         avatar_image = await self._cached_image("avatars", sid, avatar_url)
-        game_logo_image = await self._cached_image("game_headers", gameid or "unknown", self.api.get_game_header_url(gameid))
+        game_cover_image = await self._game_cover_image(gameid, game_name)
         await self._send_status_image(
             group_id,
             sid,
@@ -537,7 +545,7 @@ class SteamStatusService:
             player_name=player_name,
             game_name=game_name,
             avatar_image=avatar_image,
-            game_logo_image=game_logo_image,
+            game_cover_image=game_cover_image,
         )
 
     async def _send_end_message(
@@ -552,9 +560,7 @@ class SteamStatusService:
         gameid: str | None = None,
     ) -> None:
         avatar_image = await self._cached_image("avatars", sid, avatar_url)
-        game_logo_image = await self._cached_image(
-            "game_headers", gameid or "unknown", self.api.get_game_header_url(gameid)
-        )
+        game_cover_image = await self._game_cover_image(gameid, game_name)
         await self._send_status_image(
             group_id,
             sid,
@@ -563,7 +569,7 @@ class SteamStatusService:
             game_name=game_name,
             duration_min=duration,
             avatar_image=avatar_image,
-            game_logo_image=game_logo_image,
+            game_cover_image=game_cover_image,
         )
 
     async def _send_switch_message(
@@ -578,9 +584,7 @@ class SteamStatusService:
         new_gameid: str | None = None,
     ) -> None:
         avatar_image = await self._cached_image("avatars", sid, avatar_url)
-        game_logo_image = await self._cached_image(
-            "game_headers", new_gameid or "unknown", self.api.get_game_header_url(new_gameid)
-        )
+        game_cover_image = await self._game_cover_image(new_gameid, new_game_name)
         await self._send_status_image(
             group_id,
             sid,
@@ -589,7 +593,7 @@ class SteamStatusService:
             new_game_name=new_game_name,
             ended_games=ended_games,
             avatar_image=avatar_image,
-            game_logo_image=game_logo_image,
+            game_cover_image=game_cover_image,
         )
 
     async def _finalize_quit(

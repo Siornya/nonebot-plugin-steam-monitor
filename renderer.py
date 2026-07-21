@@ -9,12 +9,12 @@ from PIL import Image, ImageDraw, ImageFont
 from .config import RESOURCE_DIR
 
 WIDTH = 920
-START_WIDTH = 720
-START_HEIGHT = 180
-END_WIDTH = 720
-END_HEIGHT = 180
-SWITCH_WIDTH = 760
-SWITCH_HEIGHT = 220
+START_WIDTH = 680
+START_HEIGHT = 205
+END_WIDTH = 680
+END_HEIGHT = 205
+SWITCH_WIDTH = 720
+SWITCH_HEIGHT = 245
 START_TEMPLATE = RESOURCE_DIR / "steam_start_template.png"
 END_TEMPLATE = RESOURCE_DIR / "steam_end_template.png"
 SWITCH_TEMPLATE = RESOURCE_DIR / "steam_switch_template.png"
@@ -37,16 +37,16 @@ _FONT_PATHS = [
 ]
 _FONT_CACHE: dict[tuple[int, bool], ImageFont.FreeTypeFont | ImageFont.ImageFont] = {}
 
-AVATAR_BOX = (28, 42, 124, 138)
-TEXT_X = 148
-TEXT_RIGHT = 516
-LOGO_BOX = (536, 54, 692, 126)
-END_DURATION_BOX = (536, 128, 692, 152)
-SWITCH_AVATAR_BOX = (28, 62, 124, 158)
-SWITCH_TEXT_X = 148
-SWITCH_TEXT_RIGHT = 548
-SWITCH_LOGO_BOX = (568, 64, 732, 140)
-SWITCH_DURATION_BOX = (568, 144, 732, 170)
+AVATAR_BOX = (30, 50, 134, 154)
+TEXT_X = 158
+TEXT_RIGHT = 484
+LOGO_BOX = (532, 28, 632, 178)
+END_DURATION_BOX = (500, 166, 664, 192)
+SWITCH_AVATAR_BOX = (30, 72, 134, 176)
+SWITCH_TEXT_X = 158
+SWITCH_TEXT_RIGHT = 520
+SWITCH_LOGO_BOX = (588, 42, 688, 192)
+SWITCH_DURATION_BOX = (552, 184, 708, 212)
 
 
 def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -141,10 +141,9 @@ def _draw_avatar_placeholder(draw: ImageDraw.ImageDraw, box: tuple[int, int, int
 def _draw_logo_placeholder(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int]) -> None:
     draw.rounded_rectangle(box, radius=14, fill=(35, 42, 53))
     x0, y0, x1, y1 = box
-    cy = (y0 + y1) // 2
-    cx = (x0 + x1) // 2
-    draw.line((x0 + 20, cy, x1 - 20, cy), fill=(70, 82, 100), width=3)
-    draw.line((cx, y0 + 18, cx, y1 - 18), fill=(70, 82, 100), width=3)
+    draw.rounded_rectangle((x0 + 18, y0 + 18, x1 - 18, y1 - 18), radius=8, outline=(70, 82, 100), width=3)
+    draw.line((x0 + 30, y0 + 42, x1 - 30, y0 + 42), fill=(70, 82, 100), width=3)
+    draw.line((x0 + 30, y0 + 60, x1 - 30, y0 + 60), fill=(70, 82, 100), width=3)
 
 
 def _base_template(width: int, height: int, accent: tuple[int, int, int]) -> tuple[Image.Image, ImageDraw.ImageDraw]:
@@ -159,7 +158,7 @@ def create_start_template() -> Image.Image:
     img, draw = _base_template(START_WIDTH, START_HEIGHT, GREEN)
     _draw_avatar_placeholder(draw, AVATAR_BOX)
     _draw_logo_placeholder(draw, LOGO_BOX)
-    draw.line((TEXT_X, 142, TEXT_RIGHT, 142), fill=(42, 50, 63), width=1)
+    draw.line((TEXT_X, 164, TEXT_RIGHT, 164), fill=(42, 50, 63), width=1)
     return img
 
 
@@ -168,7 +167,7 @@ def create_end_template() -> Image.Image:
     _draw_avatar_placeholder(draw, AVATAR_BOX)
     _draw_logo_placeholder(draw, LOGO_BOX)
     draw.rounded_rectangle(END_DURATION_BOX, radius=12, fill=(42, 36, 27), outline=(91, 72, 36), width=1)
-    draw.line((TEXT_X, 142, TEXT_RIGHT, 142), fill=(42, 50, 63), width=1)
+    draw.line((TEXT_X, 164, TEXT_RIGHT, 164), fill=(42, 50, 63), width=1)
     return img
 
 
@@ -177,7 +176,7 @@ def create_switch_template() -> Image.Image:
     _draw_avatar_placeholder(draw, SWITCH_AVATAR_BOX)
     _draw_logo_placeholder(draw, SWITCH_LOGO_BOX)
     draw.rounded_rectangle(SWITCH_DURATION_BOX, radius=12, fill=(28, 40, 56), outline=(48, 91, 139), width=1)
-    draw.line((SWITCH_TEXT_X, 174, SWITCH_TEXT_RIGHT, 174), fill=(42, 50, 63), width=1)
+    draw.line((SWITCH_TEXT_X, 194, SWITCH_TEXT_RIGHT, 194), fill=(42, 50, 63), width=1)
     return img
 
 
@@ -239,20 +238,20 @@ def render_start_image(
     player_name: str,
     game_name: str,
     avatar_image: bytes | None = None,
-    game_logo_image: bytes | None = None,
+    game_cover_image: bytes | None = None,
 ) -> bytes:
     img = _load_template(START_TEMPLATE, create_start_template)
     draw = ImageDraw.Draw(img)
     _paste_optional(img, avatar_image, AVATAR_BOX, 18)
-    _paste_optional(img, game_logo_image, LOGO_BOX, 14)
+    _paste_optional(img, game_cover_image, LOGO_BOX, 14)
 
     player_font = _font(30, True)
     action_font = _font(18)
     game_font = _font(27, True)
     text_width = TEXT_RIGHT - TEXT_X
-    draw.text((TEXT_X, 42), _fit_text(draw, player_name, player_font, text_width), font=player_font, fill=TEXT)
-    draw.text((TEXT_X, 84), "开始玩", font=action_font, fill=GREEN)
-    draw.text((TEXT_X, 110), _fit_text(draw, game_name, game_font, text_width), font=game_font, fill=TEXT)
+    draw.text((TEXT_X, 50), _fit_text(draw, player_name, player_font, text_width), font=player_font, fill=TEXT)
+    draw.text((TEXT_X, 96), "开始玩", font=action_font, fill=GREEN)
+    draw.text((TEXT_X, 124), _fit_text(draw, game_name, game_font, text_width), font=game_font, fill=TEXT)
 
     buf = BytesIO()
     img.save(buf, format="PNG")
@@ -265,21 +264,21 @@ def render_end_image(
     game_name: str,
     duration_min: float | None = None,
     avatar_image: bytes | None = None,
-    game_logo_image: bytes | None = None,
+    game_cover_image: bytes | None = None,
 ) -> bytes:
     img = _load_template(END_TEMPLATE, create_end_template)
     draw = ImageDraw.Draw(img)
     _paste_optional(img, avatar_image, AVATAR_BOX, 18)
-    _paste_optional(img, game_logo_image, LOGO_BOX, 14)
+    _paste_optional(img, game_cover_image, LOGO_BOX, 14)
 
     player_font = _font(30, True)
     action_font = _font(18)
     game_font = _font(27, True)
     duration_font = _font(17)
     text_width = TEXT_RIGHT - TEXT_X
-    draw.text((TEXT_X, 42), _fit_text(draw, player_name, player_font, text_width), font=player_font, fill=TEXT)
-    draw.text((TEXT_X, 84), "结束了", font=action_font, fill=AMBER)
-    draw.text((TEXT_X, 110), _fit_text(draw, game_name, game_font, text_width), font=game_font, fill=TEXT)
+    draw.text((TEXT_X, 50), _fit_text(draw, player_name, player_font, text_width), font=player_font, fill=TEXT)
+    draw.text((TEXT_X, 96), "结束了", font=action_font, fill=AMBER)
+    draw.text((TEXT_X, 124), _fit_text(draw, game_name, game_font, text_width), font=game_font, fill=TEXT)
     _draw_centered_text(draw, END_DURATION_BOX, _duration(duration_min) or "已结束", duration_font, AMBER)
 
     buf = BytesIO()
@@ -294,12 +293,12 @@ def render_switch_image(
     new_game_name: str,
     duration_min: float | None = None,
     avatar_image: bytes | None = None,
-    game_logo_image: bytes | None = None,
+    game_cover_image: bytes | None = None,
 ) -> bytes:
     img = _load_template(SWITCH_TEMPLATE, create_switch_template)
     draw = ImageDraw.Draw(img)
     _paste_optional(img, avatar_image, SWITCH_AVATAR_BOX, 18)
-    _paste_optional(img, game_logo_image, SWITCH_LOGO_BOX, 14)
+    _paste_optional(img, game_cover_image, SWITCH_LOGO_BOX, 14)
 
     player_font = _font(28, True)
     small_font = _font(18)
@@ -307,11 +306,11 @@ def render_switch_image(
     new_font = _font(29, True)
     duration_font = _font(17)
     text_width = SWITCH_TEXT_RIGHT - SWITCH_TEXT_X
-    draw.text((SWITCH_TEXT_X, 42), _fit_text(draw, player_name, player_font, text_width), font=player_font, fill=TEXT)
-    draw.text((SWITCH_TEXT_X, 80), "结束了", font=small_font, fill=AMBER)
-    draw.text((SWITCH_TEXT_X + 72, 76), _fit_text(draw, old_game_name, old_font, text_width - 72), font=old_font, fill=MUTED)
-    draw.text((SWITCH_TEXT_X, 116), "开始玩", font=small_font, fill=BLUE)
-    draw.text((SWITCH_TEXT_X + 82, 110), _fit_text(draw, new_game_name, new_font, text_width - 82), font=new_font, fill=TEXT)
+    draw.text((SWITCH_TEXT_X, 52), _fit_text(draw, player_name, player_font, text_width), font=player_font, fill=TEXT)
+    draw.text((SWITCH_TEXT_X, 96), "结束了", font=small_font, fill=AMBER)
+    draw.text((SWITCH_TEXT_X + 72, 92), _fit_text(draw, old_game_name, old_font, text_width - 72), font=old_font, fill=MUTED)
+    draw.text((SWITCH_TEXT_X, 136), "开始玩", font=small_font, fill=BLUE)
+    draw.text((SWITCH_TEXT_X + 82, 130), _fit_text(draw, new_game_name, new_font, text_width - 82), font=new_font, fill=TEXT)
     _draw_centered_text(draw, SWITCH_DURATION_BOX, _duration(duration_min) or "已切换", duration_font, BLUE)
 
     buf = BytesIO()
@@ -328,14 +327,14 @@ def render_status_image(
     ended_games: list[tuple[str, float]] | None = None,
     duration_min: float | None = None,
     avatar_image: bytes | None = None,
-    game_logo_image: bytes | None = None,
+    game_cover_image: bytes | None = None,
 ) -> bytes:
     if kind == "start":
         return render_start_image(
             player_name=player_name,
             game_name=game_name or "未知游戏",
             avatar_image=avatar_image,
-            game_logo_image=game_logo_image,
+            game_cover_image=game_cover_image,
         )
     if kind == "end":
         return render_end_image(
@@ -343,7 +342,7 @@ def render_status_image(
             game_name=game_name or "未知游戏",
             duration_min=duration_min,
             avatar_image=avatar_image,
-            game_logo_image=game_logo_image,
+            game_cover_image=game_cover_image,
         )
     if kind == "switch":
         ended = ended_games or []
@@ -355,7 +354,7 @@ def render_status_image(
             new_game_name=new_game_name or "未知游戏",
             duration_min=duration,
             avatar_image=avatar_image,
-            game_logo_image=game_logo_image,
+            game_cover_image=game_cover_image,
         )
 
     accent = RED
