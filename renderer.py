@@ -9,11 +9,11 @@ from PIL import Image, ImageDraw, ImageFont
 from .config import RESOURCE_DIR
 
 WIDTH = 920
-START_WIDTH = 624
+START_WIDTH = 612
 START_HEIGHT = 205
-END_WIDTH = 624
+END_WIDTH = 612
 END_HEIGHT = 205
-SWITCH_WIDTH = 624
+SWITCH_WIDTH = 612
 SWITCH_HEIGHT = 205
 START_TEMPLATE = RESOURCE_DIR / "steam_start_template.png"
 END_TEMPLATE = RESOURCE_DIR / "steam_end_template.png"
@@ -39,13 +39,15 @@ _FONT_CACHE: dict[tuple[int, bool], ImageFont.FreeTypeFont | ImageFont.ImageFont
 
 AVATAR_BOX = (22, 50, 126, 154)
 TEXT_X = 142
-TEXT_RIGHT = 444
-LOGO_BOX = (492, 0, 624, 205)
+TEXT_RIGHT = 432
+TEXT_RULE_X = 134
+LOGO_BOX = (492, 0, 612, 205)
 DURATION_X = TEXT_X
 DURATION_Y = 164
 SWITCH_AVATAR_BOX = AVATAR_BOX
 SWITCH_TEXT_X = TEXT_X
 SWITCH_TEXT_RIGHT = TEXT_RIGHT
+SWITCH_TEXT_RULE_X = TEXT_RULE_X
 SWITCH_LOGO_BOX = LOGO_BOX
 SWITCH_DURATION_Y = 164
 
@@ -157,7 +159,7 @@ def create_start_template() -> Image.Image:
     img, draw = _base_template(START_WIDTH, START_HEIGHT, GREEN)
     _draw_avatar_placeholder(draw, AVATAR_BOX)
     _draw_logo_placeholder(draw, LOGO_BOX)
-    draw.line((TEXT_X, 164, TEXT_RIGHT, 164), fill=(42, 50, 63), width=1)
+    draw.line((TEXT_RULE_X, 164, TEXT_RIGHT, 164), fill=(42, 50, 63), width=1)
     return img
 
 
@@ -165,7 +167,7 @@ def create_end_template() -> Image.Image:
     img, draw = _base_template(END_WIDTH, END_HEIGHT, AMBER)
     _draw_avatar_placeholder(draw, AVATAR_BOX)
     _draw_logo_placeholder(draw, LOGO_BOX)
-    draw.line((TEXT_X, 164, TEXT_RIGHT, 164), fill=(42, 50, 63), width=1)
+    draw.line((TEXT_RULE_X, 164, TEXT_RIGHT, 164), fill=(42, 50, 63), width=1)
     return img
 
 
@@ -173,7 +175,7 @@ def create_switch_template() -> Image.Image:
     img, draw = _base_template(SWITCH_WIDTH, SWITCH_HEIGHT, BLUE)
     _draw_avatar_placeholder(draw, SWITCH_AVATAR_BOX)
     _draw_logo_placeholder(draw, SWITCH_LOGO_BOX)
-    draw.line((SWITCH_TEXT_X, 164, SWITCH_TEXT_RIGHT, 164), fill=(42, 50, 63), width=1)
+    draw.line((SWITCH_TEXT_RULE_X, 164, SWITCH_TEXT_RIGHT, 164), fill=(42, 50, 63), width=1)
     return img
 
 
