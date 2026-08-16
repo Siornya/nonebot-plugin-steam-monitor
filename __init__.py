@@ -15,8 +15,7 @@ from .config import CACHE_DIR, Config
 from .service import SteamStatusService
 
 require("nonebot_plugin_apscheduler")
-from nonebot_plugin_apscheduler import scheduler  # noqa: E402
-
+from nonebot_plugin_apscheduler import scheduler
 
 __plugin_meta__ = PluginMetadata(
     name="Steam 状态监控",
@@ -44,6 +43,10 @@ def _group_id(event: MessageEvent) -> str:
     if isinstance(event, GroupMessageEvent):
         return str(event.group_id)
     return "default"
+
+
+def _is_private(event: MessageEvent) -> bool:
+    return not isinstance(event, GroupMessageEvent)
 
 
 def _is_superuser(event: MessageEvent) -> bool:
@@ -101,10 +104,10 @@ def _parse_period(raw: str | None) -> tuple[int, str]:
 HELP_TEXT = """Steam 状态监控指令：
 /steam on - 启动本群监控
 /steam off - 停止本群监控
-/steam add [SteamID/链接/好友码...] - 添加监控；若已在别群监控则自动加入联动推送
-/steam rm [SteamID/链接/好友码...] - 删除本群监控或联动推送
+/steam add [SteamID/链接/好友码...] - 添加订阅
+/steam rm [SteamID/链接/好友码...] - 删除订阅
 /steam bind [SteamID/链接/好友码] - 绑定自己的 QQ 与 SteamID
-/steam list - 查看本群玩家状态
+/steam list - 查看所有订阅状态
 /steam openbox [SteamID/链接/好友码] - 查看玩家详情
 /steam rank [天数|week|month] - 本群排行榜
 /steam rank_on [all|list|test|del 群号] - 每日排行榜推送
@@ -120,17 +123,53 @@ HELP_TEXT = """Steam 状态监控指令：
 
 async def _handle_public_command(
     matcher: Matcher,
+    bot: Bot,
     event: MessageEvent,
     parts: list[str],
 ) -> None:
     sub = parts[0].lower() if parts else "help"
     group_id = _group_id(event)
+    user_id = str(event.get_user_id())
 
     if sub in {"help", "帮助"}:
         await matcher.finish(HELP_TEXT)
 
     if sub == "list":
+        if _is_private(event):
+            await matcher.finish(await service.list_private_status(user_id))
         await matcher.finish(await service.list_group_status(group_id))
+
+    if sub == "add":
+        if not _is_private(event):
+            return
+        raw_ids = _split_steam_inputs(" ".join(parts[1:]))
+        if not raw_ids:
+            await matcher.finish("用法：/steam add [SteamID/链接/好友码...]")
+        added, already, invalid = await service.subscribe_private(user_id, raw_ids, bot)
+        lines: list[str] = []
+        if added:
+            lines.append("已添加个人监控：" + ", ".join(added))
+        if already:
+            lines.append("已存在：" + ", ".join(already))
+        if invalid:
+            lines.append("无法解析：" + ", ".join(invalid))
+        await matcher.finish("\n".join(lines) if lines else "未添加任何 SteamID。")
+
+    if sub == "rm":
+        if not _is_private(event):
+            return
+        raw_ids = _split_steam_inputs(" ".join(parts[1:]))
+        if not raw_ids:
+            await matcher.finish("用法：/steam rm [SteamID/链接/好友码...]")
+        removed, missing, invalid = await service.unsubscribe_private(user_id, raw_ids)
+        lines: list[str] = []
+        if removed:
+            lines.append("已删除个人监控：" + ", ".join(removed))
+        if missing:
+            lines.append("不存在：" + ", ".join(missing))
+        if invalid:
+            lines.append("无法解析：" + ", ".join(invalid))
+        await matcher.finish("\n".join(lines) if lines else "没有可删除的 SteamID。")
 
     if sub == "openbox":
         if len(parts) < 2:
@@ -156,13 +195,7 @@ async def _handle_public_command(
         await matcher.finish(f"已绑定你的 QQ {qq} -> SteamID {sid}")
 
 
-async def _handle_admin_command(
-    matcher: Matcher,
-    bot: Bot,
-    event: MessageEvent,
-    args: Message,
-    parts: list[str],
-) -> None:
+async def _handle_admin_command(matcher: Matcher, bot: Bot, event: MessageEvent, args: Message, parts: list[str],) -> None:
     sub = parts[0].lower()
     group_id = _group_id(event)
 
@@ -259,9 +292,13 @@ async def _handle_admin_command(
 
 
 @steam_common_cmd.handle()
-async def _(event: MessageEvent, args: Annotated[Message, CommandArg()]) -> None:
+async def _(bot: Bot, event: MessageEvent, args: Annotated[Message, CommandArg()]) -> None:
     parts = _text_args(args)
     sub = parts[0].lower() if parts else "help"
+
+    if _is_private(event) and sub in {"add", "rm"}:
+        await _handle_public_command(steam_common_cmd, bot, event, parts)
+        return
 
     if sub in ADMIN_COMMANDS:
         if _is_superuser(event):
@@ -269,7 +306,7 @@ async def _(event: MessageEvent, args: Annotated[Message, CommandArg()]) -> None
         await steam_common_cmd.finish("权限不足：此指令需要超级用户权限。")
 
     if sub in PUBLIC_COMMANDS:
-        await _handle_public_command(steam_common_cmd, event, parts)
+        await _handle_public_command(steam_common_cmd, bot, event, parts)
         return
 
     await steam_common_cmd.finish("未知指令，发送 /steam help 查看帮助。")
@@ -280,7 +317,10 @@ async def _(bot: Bot, event: MessageEvent, args: Annotated[Message, CommandArg()
     parts = _text_args(args)
     if not parts:
         return
-    if parts[0].lower() not in ADMIN_COMMANDS:
+    sub = parts[0].lower()
+    if sub not in ADMIN_COMMANDS:
+        return
+    if _is_private(event) and sub in {"add", "rm"}:
         return
     await _handle_admin_command(steam_superuser_cmd, bot, event, args, parts)
 

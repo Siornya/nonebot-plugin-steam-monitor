@@ -8,13 +8,15 @@ import time
 from datetime import datetime, timedelta
 from typing import Any
 
-from nonebot import get_bots, get_driver, logger
+from nonebot import get_bots, logger
 from nonebot.adapters.onebot.v11 import Bot, MessageSegment
 
-from .config import CACHE_DIR, Config, DATA_DIR, dump_config
+from .config import CACHE_DIR, DATA_DIR, Config, dump_config
 from .renderer import render_status_image
 from .steam_api import PlayerStatus, SteamApi
 from .storage import JsonStore
+
+PRIVATE_SCOPE_PREFIX = "private:"
 
 
 PERSONA_TEXT = {
@@ -35,25 +37,16 @@ class SteamStatusService:
         self.config.update(self.store.load("config_overrides.json", {}))
 
         self.group_steam_ids: dict[str, list[str]] = self.store.load("steam_groups.json", {})
-        self.group_last_states: dict[str, dict[str, dict[str, Any]]] = self.store.load(
-            "group_states.json", {}
-        )
-        self.group_start_play_times: dict[str, dict[str, dict[str, int]]] = self.store.load(
-            "start_play_times.json", {}
-        )
-        self.group_pending_quit: dict[str, dict[str, dict[str, dict[str, Any]]]] = self.store.load(
-            "pending_quit.json", {}
-        )
-        self.play_records: dict[str, dict[str, dict[str, dict[str, Any]]]] = self.store.load(
-            "play_records.json", {}
-        )
+        self.private_steam_ids: dict[str, list[str]] = self.store.load("private_subscriptions.json", {})
+        self.group_last_states: dict[str, dict[str, dict[str, Any]]] = self.store.load("group_states.json", {})
+        self.group_start_play_times: dict[str, dict[str, dict[str, int]]] = self.store.load("start_play_times.json", {})
+        self.group_pending_quit: dict[str, dict[str, dict[str, dict[str, Any]]]] = (self.store.load("pending_quit.json", {}))
+        self.play_records: dict[str, dict[str, dict[str, dict[str, Any]]]] = (self.store.load("play_records.json", {}))
         self.bind_data: dict[str, dict[str, str]] = self.store.load("bind_data.json", {})
         self.push_groups: dict[str, list[str]] = self.store.load("push_groups.json", {})
         self.notify_bots: dict[str, str] = self.store.load("notify_bots.json", {})
         self.group_flags: dict[str, dict[str, bool]] = self.store.load("group_flags.json", {})
-        self.rank_push: dict[str, Any] = self.store.load(
-            "rank_push_groups.json", {"groups": [], "all": False}
-        )
+        self.rank_push: dict[str, Any] = self.store.load("rank_push_groups.json", {"groups": [], "all": False})
 
         self.next_poll_time: dict[str, dict[str, int]] = {}
         self.achievement_snapshots: dict[tuple[str, str, str], set[str]] = {}
@@ -87,6 +80,7 @@ class SteamStatusService:
 
     def save_static(self) -> None:
         self.store.save("steam_groups.json", self.group_steam_ids)
+        self.store.save("private_subscriptions.json", self.private_steam_ids)
         self.store.save("bind_data.json", self.bind_data)
         self.store.save("push_groups.json", self.push_groups)
         self.store.save("notify_bots.json", self.notify_bots)
@@ -113,6 +107,20 @@ class SteamStatusService:
 
     def is_group_enabled(self, group_id: str) -> bool:
         return self.group_flags.get(group_id, {}).get("monitor", False)
+
+    @staticmethod
+    def private_scope(user_id: str) -> str:
+        return f"{PRIVATE_SCOPE_PREFIX}{user_id}"
+
+    @staticmethod
+    def _private_user_id(scope_id: str) -> str | None:
+        if scope_id.startswith(PRIVATE_SCOPE_PREFIX):
+            return scope_id.removeprefix(PRIVATE_SCOPE_PREFIX)
+        return None
+
+    def _scope_label(self, scope_id: str) -> str:
+        user_id = self._private_user_id(scope_id)
+        return f"私聊 {user_id}" if user_id else f"群 {scope_id}"
 
     def set_group_enabled(self, group_id: str, enabled: bool) -> None:
         self.group_flags.setdefault(group_id, {})["monitor"] = enabled
@@ -169,6 +177,52 @@ class SteamStatusService:
         self.notify_bots[group_id] = bot.self_id
         self.save_static()
 
+    def _get_private_push_bot(self, user_id: str) -> Bot | None:
+        bots = get_bots()
+        bot_id = self.notify_bots.get(self.private_scope(user_id))
+        bot = bots.get(bot_id) if bot_id else None
+        if not bot and bots:
+            bot = next(iter(bots.values()))
+        if not bot:
+            logger.warning(f"[steam_status_monitor] 无可用 Bot，无法推送私聊 {user_id}")
+        return bot
+
+    async def send_private_text(self, user_id: str, text: str) -> bool:
+        if not text:
+            return False
+        bot = self._get_private_push_bot(user_id)
+        if not bot:
+            return False
+        try:
+            await bot.send_private_msg(
+                user_id=int(user_id), message=MessageSegment.text(text)
+            )
+            return True
+        except Exception as exc:
+            logger.warning(f"[steam_status_monitor] 推送私聊 {user_id} 文本失败: {exc}")
+            return False
+
+    async def send_private_image(self, user_id: str, image: bytes) -> bool:
+        if not image:
+            return False
+        bot = self._get_private_push_bot(user_id)
+        if not bot:
+            return False
+        try:
+            image_b64 = base64.b64encode(image).decode()
+            await bot.send_private_msg(
+                user_id=int(user_id),
+                message=MessageSegment.image(f"base64://{image_b64}"),
+            )
+            return True
+        except Exception as exc:
+            logger.warning(f"[steam_status_monitor] 推送私聊 {user_id} 图片失败: {exc}")
+            return False
+
+    def remember_private_bot(self, user_id: str, bot: Bot) -> None:
+        self.notify_bots[self.private_scope(user_id)] = bot.self_id
+        self.save_static()
+
     def _target_groups(self, group_id: str, sid: str) -> list[str]:
         groups = [group_id]
         for gid in self.push_groups.get(sid, []):
@@ -176,14 +230,27 @@ class SteamStatusService:
                 groups.append(gid)
         return groups
 
-    async def send_to_targets(self, group_id: str, sid: str, text: str) -> None:
-        for target in self._target_groups(group_id, sid):
-            await self.send_group_text(target, text)
+    def _target_scopes(self, scope_id: str, sid: str) -> list[str]:
+        if self._private_user_id(scope_id):
+            return [scope_id]
+        return self._target_groups(scope_id, sid)
 
-    async def send_image_to_targets(self, group_id: str, sid: str, image: bytes) -> bool:
+    async def send_to_targets(self, scope_id: str, sid: str, text: str) -> None:
+        for target in self._target_scopes(scope_id, sid):
+            user_id = self._private_user_id(target)
+            if user_id:
+                await self.send_private_text(user_id, text)
+            else:
+                await self.send_group_text(target, text)
+
+    async def send_image_to_targets(self, scope_id: str, sid: str, image: bytes) -> bool:
         ok = False
-        for target in self._target_groups(group_id, sid):
-            ok = await self.send_group_image(target, image) or ok
+        for target in self._target_scopes(scope_id, sid):
+            user_id = self._private_user_id(target)
+            if user_id:
+                ok = await self.send_private_image(user_id, image) or ok
+            else:
+                ok = await self.send_group_image(target, image) or ok
         return ok
 
     def display_name(self, sid: str, steam_name: str | None = None) -> str:
@@ -240,6 +307,86 @@ class SteamStatusService:
 
         self.save_static()
         return added, linked, already, invalid
+
+    async def subscribe_private(
+        self, user_id: str, raw_values: list[str], bot: Bot
+    ) -> tuple[list[str], list[str], list[str]]:
+        resolved: list[str] = []
+        invalid: list[str] = []
+        for raw in raw_values:
+            sid = await self.api.resolve_steam_input(raw)
+            if sid and sid.isdigit() and len(sid) == 17:
+                if sid not in resolved:
+                    resolved.append(sid)
+            else:
+                invalid.append(raw)
+
+        user_id = str(user_id)
+        ids = self.private_steam_ids.setdefault(user_id, [])
+        added: list[str] = []
+        already: list[str] = []
+        limit = int(self.config.get("max_group_size", 20))
+        for sid in resolved:
+            if sid in ids:
+                already.append(sid)
+            elif len(ids) < limit:
+                ids.append(sid)
+                added.append(sid)
+
+        scope_id = self.private_scope(user_id)
+        if ids:
+            self.remember_private_bot(user_id, bot)
+            for sid in added:
+                self.next_poll_time.setdefault(scope_id, {}).pop(sid, None)
+        else:
+            self.private_steam_ids.pop(user_id, None)
+        return added, already, invalid
+
+    async def unsubscribe_private(
+        self, user_id: str, raw_values: list[str]
+    ) -> tuple[list[str], list[str], list[str]]:
+        resolved: list[str] = []
+        invalid: list[str] = []
+        for raw in raw_values:
+            sid = await self.api.resolve_steam_input(raw)
+            if sid and sid.isdigit() and len(sid) == 17:
+                if sid not in resolved:
+                    resolved.append(sid)
+            else:
+                invalid.append(raw)
+
+        user_id = str(user_id)
+        scope_id = self.private_scope(user_id)
+        ids = self.private_steam_ids.get(user_id, [])
+        removed: list[str] = []
+        missing: list[str] = []
+        for sid in resolved:
+            if sid in ids:
+                ids.remove(sid)
+                removed.append(sid)
+                self._clear_scope_sid(scope_id, sid)
+            else:
+                missing.append(sid)
+
+        if ids:
+            self.private_steam_ids[user_id] = ids
+        else:
+            self.private_steam_ids.pop(user_id, None)
+            self.notify_bots.pop(scope_id, None)
+        self.save_static()
+        self.save_runtime()
+        return removed, missing, invalid
+
+    def _clear_scope_sid(self, scope_id: str, sid: str) -> None:
+        self.next_poll_time.get(scope_id, {}).pop(sid, None)
+        self.group_last_states.get(scope_id, {}).pop(sid, None)
+        self.group_start_play_times.get(scope_id, {}).pop(sid, None)
+        self.group_pending_quit.get(scope_id, {}).pop(sid, None)
+        for key, task in list(self.achievement_tasks.items()):
+            if key[:2] == (scope_id, sid):
+                task.cancel()
+                self.achievement_tasks.pop(key, None)
+                self.achievement_snapshots.pop(key, None)
 
     async def delete_steam_id(self, group_id: str, raw_value: str) -> tuple[bool, str]:
         sid = await self.api.resolve_steam_input(raw_value)
@@ -303,7 +450,7 @@ class SteamStatusService:
         async with self._poll_lock:
             await self._maybe_push_daily_rank()
             now = int(time.time())
-            group_sids: dict[str, list[str]] = {}
+            scope_sids: dict[str, list[str]] = {}
             all_sids: set[str] = set()
             for group_id, ids in self.group_steam_ids.items():
                 if not self.is_group_enabled(group_id):
@@ -314,20 +461,31 @@ class SteamStatusService:
                     if now >= self.next_poll_time.setdefault(group_id, {}).get(sid, 0)
                 ]
                 if due:
-                    group_sids[group_id] = due
+                    scope_sids[group_id] = due
                     all_sids.update(due)
 
-            if not group_sids:
+            for user_id, ids in self.private_steam_ids.items():
+                scope_id = self.private_scope(user_id)
+                due = [
+                    sid
+                    for sid in ids
+                    if now >= self.next_poll_time.setdefault(scope_id, {}).get(sid, 0)
+                ]
+                if due:
+                    scope_sids[scope_id] = due
+                    all_sids.update(due)
+
+            if not scope_sids:
                 await self._finalize_due_quits()
                 return
 
             status_map = await self.api.fetch_player_statuses(list(all_sids))
             logs: list[str] = []
-            for group_id, ids in group_sids.items():
+            for scope_id, ids in scope_sids.items():
                 for sid in ids:
-                    line = await self._process_status(group_id, sid, status_map.get(sid))
+                    line = await self._process_status(scope_id, sid, status_map.get(sid))
                     if line:
-                        logs.append(f"群 {group_id}: {line}")
+                        logs.append(f"{self._scope_label(scope_id)}: {line}")
             await self._finalize_due_quits()
             self.save_runtime()
             if logs and self.config.get("detailed_poll_log", True):
@@ -496,10 +654,10 @@ class SteamStatusService:
         try:
             image = render_status_image(**kwargs)
         except Exception as exc:
-            logger.warning(f"[steam_status_monitor] 渲染状态图片失败: {exc}")
+            logger.warning(f"[steam_monitor] 渲染状态图片失败: {exc}")
             return
         if not await self.send_image_to_targets(group_id, sid, image):
-            logger.warning(f"[steam_status_monitor] 状态图片未成功推送到任何目标群 sid={sid}")
+            logger.warning(f"[steam_monitor] 状态图片未成功推送到任何目标 sid={sid}")
 
     async def _cached_image(self, cache_type: str, key: str, url: str | None) -> bytes | None:
         if not url:
@@ -724,7 +882,8 @@ class SteamStatusService:
     async def _check_achievements(
         self, group_id: str, sid: str, gameid: str, player_name: str, game_name: str
     ) -> None:
-        if gameid in self._achievement_blacklist or not self.is_achievement_enabled(group_id):
+        if gameid in self._achievement_blacklist or not self.is_achievement_enabled(group_id
+        ):
             return
         key = (group_id, sid, gameid)
         before = self.achievement_snapshots.get(key)
@@ -764,6 +923,29 @@ class SteamStatusService:
             extra = ""
             if status.gameid:
                 start = self._get_start_time(group_id, sid, status.gameid)
+                if start:
+                    extra = f"，已玩 {self._format_minutes((time.time() - start) / 60)}"
+            lines.append(f"- {self._status_line(name, status, game_name)}{extra}")
+        return "\n".join(lines)
+
+    async def list_private_status(self, user_id: str) -> str:
+        user_id = str(user_id)
+        scope_id = self.private_scope(user_id)
+        ids = self.private_steam_ids.get(user_id, [])
+        if not ids:
+            return "你还没有个人监控，请使用 /steam add 添加。"
+        status_map = await self.api.fetch_player_statuses(ids)
+        lines = ["Steam 状态列表（个人）"]
+        for sid in ids:
+            status = status_map.get(sid)
+            if not status:
+                lines.append(f"- {sid}: 获取失败")
+                continue
+            name = self.display_name(sid, status.name)
+            game_name, _ = await self.api.get_game_names(status.gameid, status.gameextrainfo)
+            extra = ""
+            if status.gameid:
+                start = self._get_start_time(scope_id, sid, status.gameid)
                 if start:
                     extra = f"，已玩 {self._format_minutes((time.time() - start) / 60)}"
             lines.append(f"- {self._status_line(name, status, game_name)}{extra}")
@@ -816,9 +998,7 @@ class SteamStatusService:
         rows.sort(key=lambda x: x["total_minutes"], reverse=True)
         return rows
 
-    async def rank_text(
-        self, days: int, group_id: str | None = None, label: str = "今日", offset: int = 0
-    ) -> str:
+    async def rank_text(self, days: int, group_id: str | None = None, label: str = "今日", offset: int = 0) -> str:
         rows = self.rank_data(days, group_id, offset)
         if not rows:
             return f"暂无{label}游玩记录，游戏结束后才会计入排行榜。"
@@ -925,4 +1105,3 @@ class SteamStatusService:
             task.cancel()
         self.achievement_tasks.clear()
         self.save_runtime()
-
