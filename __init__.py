@@ -36,8 +36,8 @@ steam_superuser_cmd = on_command("steam", aliases={"Steam"}, permission=SUPERUSE
 steamwho_cmd = on_command("steamwho", aliases={"在干嘛"}, priority=5, block=True)
 clear_cache_cmd = on_command("steam清除缓存", permission=SUPERUSER, priority=5, block=True)
 
-PUBLIC_COMMANDS = {"help", "帮助", "list", "openbox", "rank", "config", "bind"}
-ADMIN_COMMANDS = {"on", "off", "add", "rm", "rank_on", "achievement_on", "achievement_off", "set", "rs", "clear", "clear_allgroup"}
+PUBLIC_COMMANDS = {"help", "帮助", "list", "add", "rm", "openbox", "rank", "config", "bind"}
+ADMIN_COMMANDS = {"on", "off", "star", "rank_on", "achievement_on", "achievement_off", "set", "rs", "clear", "clear_allgroup"}
 
 def _group_id(event: MessageEvent) -> str:
     if isinstance(event, GroupMessageEvent):
@@ -106,6 +106,7 @@ HELP_TEXT = """Steam 状态监控指令：
 /steam off - 停止本群监控
 /steam add [SteamID/链接/好友码...] - 添加订阅
 /steam rm [SteamID/链接/好友码...] - 删除订阅
+/steam star [SteamID/链接/好友码...] - Star 玩家并推送在线状态变化（超级用户）
 /steam bind [SteamID/链接/好友码] - 绑定自己的 QQ 与 SteamID
 /steam list - 查看所有订阅状态
 /steam openbox [SteamID/链接/好友码] - 查看玩家详情
@@ -140,15 +141,28 @@ async def _handle_public_command(
         await matcher.finish(await service.list_group_status(group_id))
 
     if sub == "add":
-        if not _is_private(event):
-            return
         raw_ids = _split_steam_inputs(" ".join(parts[1:]))
         if not raw_ids:
             await matcher.finish("用法：/steam add [SteamID/链接/好友码...]")
-        added, already, invalid = await service.subscribe_private(user_id, raw_ids, bot)
+        if _is_private(event):
+            added, already, invalid = await service.subscribe_private(user_id, raw_ids, bot)
+            lines: list[str] = []
+            if added:
+                lines.append("已添加个人监控：" + ", ".join(added))
+            if already:
+                lines.append("已存在：" + ", ".join(already))
+            if invalid:
+                lines.append("无法解析：" + ", ".join(invalid))
+            await matcher.finish("\n".join(lines) if lines else "未添加任何 SteamID。")
+
+        added, linked, already, invalid = await service.add_steam_ids(group_id, raw_ids)
+        if linked:
+            service.remember_bot(group_id, bot)
         lines: list[str] = []
         if added:
-            lines.append("已添加个人监控：" + ", ".join(added))
+            lines.append("已添加：" + ", ".join(added))
+        if linked:
+            lines.append("已存在于其他群主监控，本群自动加入联动推送：" + ", ".join(linked))
         if already:
             lines.append("已存在：" + ", ".join(already))
         if invalid:
@@ -156,20 +170,26 @@ async def _handle_public_command(
         await matcher.finish("\n".join(lines) if lines else "未添加任何 SteamID。")
 
     if sub == "rm":
-        if not _is_private(event):
-            return
         raw_ids = _split_steam_inputs(" ".join(parts[1:]))
         if not raw_ids:
             await matcher.finish("用法：/steam rm [SteamID/链接/好友码...]")
-        removed, missing, invalid = await service.unsubscribe_private(user_id, raw_ids)
-        lines: list[str] = []
-        if removed:
-            lines.append("已删除个人监控：" + ", ".join(removed))
-        if missing:
-            lines.append("不存在：" + ", ".join(missing))
-        if invalid:
-            lines.append("无法解析：" + ", ".join(invalid))
-        await matcher.finish("\n".join(lines) if lines else "没有可删除的 SteamID。")
+        if _is_private(event):
+            removed, missing, invalid = await service.unsubscribe_private(user_id, raw_ids)
+            lines: list[str] = []
+            if removed:
+                lines.append("已删除个人监控：" + ", ".join(removed))
+            if missing:
+                lines.append("不存在：" + ", ".join(missing))
+            if invalid:
+                lines.append("无法解析：" + ", ".join(invalid))
+            await matcher.finish("\n".join(lines) if lines else "没有可删除的 SteamID。")
+
+        target_group = group_id
+        if _is_superuser(event):
+            raw_ids, target_group = _parse_rm_inputs(parts, group_id)
+        results = [await service.delete_steam_id(target_group, raw) for raw in raw_ids]
+        lines = [msg for _, msg in results]
+        await matcher.finish("\n".join(lines))
 
     if sub == "openbox":
         if len(parts) < 2:
@@ -205,32 +225,28 @@ async def _handle_admin_command(matcher: Matcher, bot: Bot, event: MessageEvent,
     if sub == "off":
         await matcher.finish(service.stop_group(group_id))
 
-    if sub == "add":
+    if sub == "star":
+        if _is_private(event):
+            await matcher.finish("/steam star 仅支持在群聊中使用。")
         raw_ids = _split_steam_inputs(_arg_body(args))
         if not raw_ids:
-            await matcher.finish("用法：/steam add [SteamID/链接/好友码...]")
-        added, linked, already, invalid = await service.add_steam_ids(group_id, raw_ids)
-        if linked:
+            await matcher.finish("用法：/steam star [SteamID/链接/好友码...]")
+        starred, already_starred, added, linked, invalid = await service.star_steam_ids(group_id, raw_ids)
+        if starred or already_starred:
             service.remember_bot(group_id, bot)
 
         lines: list[str] = []
         if added:
-            lines.append("已添加：" + ", ".join(added))
+            lines.append("已自动添加监控：" + ", ".join(added))
         if linked:
-            lines.append("已存在于其他群主监控，本群自动加入联动推送：" + ", ".join(linked))
-        if already:
-            lines.append("已存在：" + ", ".join(already))
+            lines.append("已自动加入本群联动推送：" + ", ".join(linked))
+        if starred:
+            lines.append("已 Star：" + ", ".join(starred))
+        if already_starred:
+            lines.append("已经 Star：" + ", ".join(already_starred))
         if invalid:
             lines.append("无法解析：" + ", ".join(invalid))
-        await matcher.finish("\n".join(lines) if lines else "未添加任何 SteamID。")
-
-    if sub == "rm":
-        raw_ids, target_group = _parse_rm_inputs(parts, group_id)
-        if not raw_ids:
-            await matcher.finish("用法：/steam rm [SteamID/链接/好友码...]")
-        results = [await service.delete_steam_id(target_group, raw) for raw in raw_ids]
-        lines = [msg for _, msg in results]
-        await matcher.finish("\n".join(lines))
+        await matcher.finish("\n".join(lines) if lines else "未 Star 任何 SteamID。")
 
     if sub == "rank_on":
         param = parts[1].lower() if len(parts) >= 2 else ""
@@ -276,6 +292,7 @@ async def _handle_admin_command(matcher: Matcher, bot: Bot, event: MessageEvent,
 
     if sub == "clear_allgroup":
         service.group_steam_ids.clear()
+        service.starred_steam_ids.clear()
         service.reset_runtime()
         service.save_static()
         await matcher.finish("已清空所有群的 SteamID。")
@@ -283,6 +300,7 @@ async def _handle_admin_command(matcher: Matcher, bot: Bot, event: MessageEvent,
     if sub == "clear":
         target = parts[1] if len(parts) >= 2 else group_id
         service.group_steam_ids.pop(target, None)
+        service.starred_steam_ids.pop(target, None)
         service.group_last_states.pop(target, None)
         service.group_start_play_times.pop(target, None)
         service.group_pending_quit.pop(target, None)
@@ -295,10 +313,6 @@ async def _handle_admin_command(matcher: Matcher, bot: Bot, event: MessageEvent,
 async def _(bot: Bot, event: MessageEvent, args: Annotated[Message, CommandArg()]) -> None:
     parts = _text_args(args)
     sub = parts[0].lower() if parts else "help"
-
-    if _is_private(event) and sub in {"add", "rm"}:
-        await _handle_public_command(steam_common_cmd, bot, event, parts)
-        return
 
     if sub in ADMIN_COMMANDS:
         if _is_superuser(event):
@@ -319,8 +333,6 @@ async def _(bot: Bot, event: MessageEvent, args: Annotated[Message, CommandArg()
         return
     sub = parts[0].lower()
     if sub not in ADMIN_COMMANDS:
-        return
-    if _is_private(event) and sub in {"add", "rm"}:
         return
     await _handle_admin_command(steam_superuser_cmd, bot, event, args, parts)
 

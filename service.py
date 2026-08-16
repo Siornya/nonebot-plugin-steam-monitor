@@ -29,6 +29,16 @@ PERSONA_TEXT = {
     6: "想玩游戏",
 }
 
+STAR_PERSONA_TEXT = {
+    0: "离线",
+    1: "上线",
+    2: "忙碌",
+    3: "离开",
+    4: "打盹",
+    5: "想交易",
+    6: "想玩游戏",
+}
+
 
 class SteamStatusService:
     def __init__(self, config: Config):
@@ -38,6 +48,7 @@ class SteamStatusService:
 
         self.group_steam_ids: dict[str, list[str]] = self.store.load("steam_groups.json", {})
         self.private_steam_ids: dict[str, list[str]] = self.store.load("private_subscriptions.json", {})
+        self.starred_steam_ids: dict[str, list[str]] = self.store.load("starred_players.json", {})
         self.group_last_states: dict[str, dict[str, dict[str, Any]]] = self.store.load("group_states.json", {})
         self.group_start_play_times: dict[str, dict[str, dict[str, int]]] = self.store.load("start_play_times.json", {})
         self.group_pending_quit: dict[str, dict[str, dict[str, dict[str, Any]]]] = (self.store.load("pending_quit.json", {}))
@@ -81,6 +92,7 @@ class SteamStatusService:
     def save_static(self) -> None:
         self.store.save("steam_groups.json", self.group_steam_ids)
         self.store.save("private_subscriptions.json", self.private_steam_ids)
+        self.store.save("starred_players.json", self.starred_steam_ids)
         self.store.save("bind_data.json", self.bind_data)
         self.store.save("push_groups.json", self.push_groups)
         self.store.save("notify_bots.json", self.notify_bots)
@@ -308,6 +320,26 @@ class SteamStatusService:
         self.save_static()
         return added, linked, already, invalid
 
+    async def star_steam_ids(
+        self, group_id: str, raw_values: list[str]
+    ) -> tuple[list[str], list[str], list[str], list[str], list[str]]:
+        added, linked, already, invalid = await self.add_steam_ids(group_id, raw_values)
+        monitored = list(dict.fromkeys([*added, *linked, *already]))
+        group_starred = self.starred_steam_ids.setdefault(group_id, [])
+        starred: list[str] = []
+        already_starred: list[str] = []
+        for sid in monitored:
+            if sid in group_starred:
+                already_starred.append(sid)
+            else:
+                group_starred.append(sid)
+                starred.append(sid)
+
+        if not group_starred:
+            self.starred_steam_ids.pop(group_id, None)
+        self.save_static()
+        return starred, already_starred, added, linked, invalid
+
     async def subscribe_private(
         self, user_id: str, raw_values: list[str], bot: Bot
     ) -> tuple[list[str], list[str], list[str]]:
@@ -388,6 +420,13 @@ class SteamStatusService:
                 self.achievement_tasks.pop(key, None)
                 self.achievement_snapshots.pop(key, None)
 
+    def _remove_star(self, group_id: str, sid: str) -> None:
+        starred = self.starred_steam_ids.get(group_id, [])
+        if sid in starred:
+            starred.remove(sid)
+        if not starred:
+            self.starred_steam_ids.pop(group_id, None)
+
     async def delete_steam_id(self, group_id: str, raw_value: str) -> tuple[bool, str]:
         sid = await self.api.resolve_steam_input(raw_value)
         if not sid:
@@ -396,6 +435,7 @@ class SteamStatusService:
         if sid in ids:
             ids.remove(sid)
             self.group_steam_ids[group_id] = ids
+            self._remove_star(group_id, sid)
             for qq, info in list(self.bind_data.items()):
                 if info.get("sid") == sid:
                     self.bind_data.pop(qq, None)
@@ -404,6 +444,7 @@ class SteamStatusService:
 
         if sid in self.push_groups and group_id in self.push_groups[sid]:
             self.push_groups[sid].remove(group_id)
+            self._remove_star(group_id, sid)
             if not self.push_groups[sid]:
                 self.push_groups.pop(sid, None)
             self.save_static()
@@ -514,6 +555,15 @@ class SteamStatusService:
                 start_times.setdefault(sid, {})[current_gameid] = now
             self._schedule_next_poll(group_id, sid, status)
             return self._status_line(player_name, status, zh_game_name)
+
+        previous_persona = int(prev.get("personastate") or 0)
+        if (
+            self._private_user_id(group_id) is None
+            and previous_persona != status.personastate
+        ):
+            await self._send_starred_persona_change(
+                group_id, sid, player_name, status.personastate
+            )
 
         ended_games: list[tuple[str, float]] = []
         if prev_gameid and prev_gameid != current_gameid:
@@ -642,6 +692,15 @@ class SteamStatusService:
             hours = (int(time.time()) - status.lastlogoff) / 3600
             return f"{name} 离线，上次在线 {hours:.1f} 小时前"
         return f"{name} 离线"
+
+    async def _send_starred_persona_change(
+        self, owner_group_id: str, sid: str, player_name: str, personastate: int
+    ) -> None:
+        state_text = STAR_PERSONA_TEXT.get(personastate, "状态发生变化")
+        text = f"【Steam 状态】{player_name} {state_text}"
+        for target_group in self._target_groups(owner_group_id, sid):
+            if sid in self.starred_steam_ids.get(target_group, []):
+                await self.send_group_text(target_group, text)
 
     def _record_quit(self, sid: str, gameid: str, info: dict[str, Any]) -> tuple[str, float]:
         info["notified"] = True
