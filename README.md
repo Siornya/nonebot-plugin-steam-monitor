@@ -166,27 +166,3 @@ SGDB_API_KEY=your_steamgriddb_api_key
 未设置固定间隔时，插件会根据玩家状态调整轮询频率：游戏中轮询最频繁，在线、刚离线和长期离线状态依次降低频率。同一轮到期的 SteamID 会合并请求，Steam API 每批最多查询 100 个玩家。
 
 游戏退出后会等待约 3 分钟再发送结束通知，以减少游戏短暂断开或快速重连产生的误报。游玩记录在游戏结束后写入，并保留最近 30 天。
-
-## 注意事项
-
-- Steam 隐私设置会影响当前游戏、成就和游玩数据的可见性。
-- NapCat 必须保持 QQ 登录，并启用可用的 OneBot V11 连接。
-- 私聊主动推送要求机器人能够向该 QQ 用户发送私聊消息。
-- 修改 Python 代码或模板布局后需要重启 Bot 服务。
-- 未配置 `sgdb_api_key` 时不会下载 SteamGridDB 竖版封面，但状态图片仍可正常生成。
-
-## 故障排查
-
-查看 Bot 服务日志：
-
-```bash
-journalctl -u feather-bot -n 100 --no-pager
-journalctl -u feather-bot -f
-```
-
-常见问题：
-
-- 插件加载但没有轮询：检查 `steam_api_key`，群聊还需确认已执行 `/steam on`。
-- 状态或成就为空：检查目标 Steam 账号的隐私设置。
-- 图片发送超时：检查 NapCat、QQ 登录状态和 OneBot 连接日志。
-- 修改未生效：重启 Bot 服务后再次检查启动日志。

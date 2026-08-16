@@ -31,8 +31,7 @@ __plugin_meta__ = PluginMetadata(
 plugin_config = get_plugin_config(Config)
 service = SteamStatusService(plugin_config)
 
-steam_common_cmd = on_command("steam", aliases={"Steam"}, priority=5, block=False)
-steam_superuser_cmd = on_command("steam", aliases={"Steam"}, permission=SUPERUSER, priority=5, block=True)
+steam_cmd = on_command("steam", aliases={"Steam"}, priority=5, block=True)
 steamwho_cmd = on_command("steamwho", aliases={"在干嘛"}, priority=5, block=True)
 clear_cache_cmd = on_command("steam清除缓存", permission=SUPERUSER, priority=5, block=True)
 
@@ -68,11 +67,6 @@ def _is_superuser(event: MessageEvent) -> bool:
 def _text_args(args: Message) -> list[str]:
     text = str(args).strip()
     return text.split() if text else []
-
-
-def _arg_body(args: Message) -> str:
-    text = str(args).strip()
-    return text.split(maxsplit=1)[1].strip() if " " in text else ""
 
 
 def _split_steam_inputs(raw: str) -> list[str]:
@@ -263,7 +257,13 @@ async def _handle_public_command(
         await matcher.finish(f"已绑定你的 QQ {qq} -> SteamID {sid}")
 
 
-async def _handle_admin_command(matcher: Matcher, bot: Bot, event: MessageEvent, args: Message, parts: list[str],) -> None:
+async def _handle_admin_command(
+    matcher: Matcher,
+    bot: Bot,
+    event: MessageEvent,
+    args: Message,
+    parts: list[str],
+) -> None:
     sub = parts[0].lower()
     group_id = _group_id(event)
 
@@ -347,32 +347,22 @@ async def _handle_admin_command(matcher: Matcher, bot: Bot, event: MessageEvent,
         await matcher.finish(f"已清空群 {target} 的 SteamID。")
 
 
-@steam_common_cmd.handle()
+@steam_cmd.handle()
 async def _(bot: Bot, event: MessageEvent, args: Annotated[Message, CommandArg()]) -> None:
     parts = _text_args(args)
     sub = parts[0].lower() if parts else "help"
 
     if sub in ADMIN_COMMANDS:
-        if _is_superuser(event):
-            return
-        await steam_common_cmd.finish("权限不足：此指令需要超级用户权限。")
+        if not _is_superuser(event):
+            await steam_cmd.finish("权限不足：此指令需要超级用户权限。")
+        await _handle_admin_command(steam_cmd, bot, event, args, parts)
+        return
 
     if sub in PUBLIC_COMMANDS:
-        await _handle_public_command(steam_common_cmd, bot, event, parts)
+        await _handle_public_command(steam_cmd, bot, event, parts)
         return
 
-    await steam_common_cmd.finish("未知指令，发送 /steam help 查看帮助。")
-
-
-@steam_superuser_cmd.handle()
-async def _(bot: Bot, event: MessageEvent, args: Annotated[Message, CommandArg()]) -> None:
-    parts = _text_args(args)
-    if not parts:
-        return
-    sub = parts[0].lower()
-    if sub not in ADMIN_COMMANDS:
-        return
-    await _handle_admin_command(steam_superuser_cmd, bot, event, args, parts)
+    await steam_cmd.finish("未知指令，发送 /steam help 查看帮助。")
 
 
 @steamwho_cmd.handle()

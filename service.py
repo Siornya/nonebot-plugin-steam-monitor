@@ -52,7 +52,9 @@ class SteamStatusService:
         self.starred_steam_ids: dict[str, list[str]] = self.store.load("starred_players.json", {})
         self.group_last_states: dict[str, dict[str, dict[str, Any]]] = self.store.load("group_states.json", {})
         self.group_start_play_times: dict[str, dict[str, dict[str, int]]] = self.store.load("start_play_times.json", {})
-        self.group_pending_quit: dict[str, dict[str, dict[str, dict[str, Any]]]] = (self.store.load("pending_quit.json", {}))
+        self.group_pending_quit: dict[str, dict[str, dict[str, dict[str, Any]]]] = self.store.load(
+            "pending_quit.json", {}
+        )
         self.play_records: dict[str, dict[str, dict[str, dict[str, Any]]]] = (self.store.load("play_records.json", {}))
         self.bind_data: dict[str, dict[str, str]] = self.store.load("bind_data.json", {})
         self.push_groups: dict[str, list[str]] = self.store.load("push_groups.json", {})
@@ -303,9 +305,9 @@ class SteamStatusService:
         self.bind_data[str(qq)] = {"sid": sid, "nickname": nickname or "*"}
         self.save_static()
 
-    async def add_steam_ids(
-        self, group_id: str, raw_values: list[str]
-    ) -> tuple[list[str], list[str], list[str], list[str]]:
+    async def _resolve_steam_inputs(
+        self, raw_values: list[str]
+    ) -> tuple[list[str], list[str]]:
         resolved: list[str] = []
         invalid: list[str] = []
         for raw in raw_values:
@@ -315,6 +317,28 @@ class SteamStatusService:
                     resolved.append(sid)
             else:
                 invalid.append(raw)
+        return resolved, invalid
+
+    def _mark_starred(
+        self, scope_id: str, monitored: list[str]
+    ) -> tuple[list[str], list[str]]:
+        scope_starred = self.starred_steam_ids.setdefault(scope_id, [])
+        starred: list[str] = []
+        already_starred: list[str] = []
+        for sid in monitored:
+            if sid in scope_starred:
+                already_starred.append(sid)
+            else:
+                scope_starred.append(sid)
+                starred.append(sid)
+        if not scope_starred:
+            self.starred_steam_ids.pop(scope_id, None)
+        return starred, already_starred
+
+    async def add_steam_ids(
+        self, group_id: str, raw_values: list[str]
+    ) -> tuple[list[str], list[str], list[str], list[str]]:
+        resolved, invalid = await self._resolve_steam_inputs(raw_values)
 
         ids = self.group_steam_ids.setdefault(group_id, [])
         added: list[str] = []
@@ -351,18 +375,7 @@ class SteamStatusService:
     ) -> tuple[list[str], list[str], list[str], list[str], list[str]]:
         added, linked, already, invalid = await self.add_steam_ids(group_id, raw_values)
         monitored = list(dict.fromkeys([*added, *linked, *already]))
-        group_starred = self.starred_steam_ids.setdefault(group_id, [])
-        starred: list[str] = []
-        already_starred: list[str] = []
-        for sid in monitored:
-            if sid in group_starred:
-                already_starred.append(sid)
-            else:
-                group_starred.append(sid)
-                starred.append(sid)
-
-        if not group_starred:
-            self.starred_steam_ids.pop(group_id, None)
+        starred, already_starred = self._mark_starred(group_id, monitored)
         self.save_static()
         return starred, already_starred, added, linked, invalid
 
@@ -372,33 +385,14 @@ class SteamStatusService:
         added, already, invalid = await self.subscribe_private(user_id, raw_values, bot)
         scope_id = self.private_scope(str(user_id))
         monitored = list(dict.fromkeys([*added, *already]))
-        scope_starred = self.starred_steam_ids.setdefault(scope_id, [])
-        starred: list[str] = []
-        already_starred: list[str] = []
-        for sid in monitored:
-            if sid in scope_starred:
-                already_starred.append(sid)
-            else:
-                scope_starred.append(sid)
-                starred.append(sid)
-
-        if not scope_starred:
-            self.starred_steam_ids.pop(scope_id, None)
+        starred, already_starred = self._mark_starred(scope_id, monitored)
         self.save_static()
         return starred, already_starred, added, invalid
 
     async def subscribe_private(
         self, user_id: str, raw_values: list[str], bot: Bot
     ) -> tuple[list[str], list[str], list[str]]:
-        resolved: list[str] = []
-        invalid: list[str] = []
-        for raw in raw_values:
-            sid = await self.api.resolve_steam_input(raw)
-            if sid and sid.isdigit() and len(sid) == 17:
-                if sid not in resolved:
-                    resolved.append(sid)
-            else:
-                invalid.append(raw)
+        resolved, invalid = await self._resolve_steam_inputs(raw_values)
 
         user_id = str(user_id)
         ids = self.private_steam_ids.setdefault(user_id, [])
@@ -424,15 +418,7 @@ class SteamStatusService:
     async def unsubscribe_private(
         self, user_id: str, raw_values: list[str]
     ) -> tuple[list[str], list[str], list[str]]:
-        resolved: list[str] = []
-        invalid: list[str] = []
-        for raw in raw_values:
-            sid = await self.api.resolve_steam_input(raw)
-            if sid and sid.isdigit() and len(sid) == 17:
-                if sid not in resolved:
-                    resolved.append(sid)
-            else:
-                invalid.append(raw)
+        resolved, invalid = await self._resolve_steam_inputs(raw_values)
 
         user_id = str(user_id)
         scope_id = self.private_scope(user_id)
