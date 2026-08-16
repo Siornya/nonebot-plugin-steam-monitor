@@ -36,8 +36,20 @@ steam_superuser_cmd = on_command("steam", aliases={"Steam"}, permission=SUPERUSE
 steamwho_cmd = on_command("steamwho", aliases={"在干嘛"}, priority=5, block=True)
 clear_cache_cmd = on_command("steam清除缓存", permission=SUPERUSER, priority=5, block=True)
 
-PUBLIC_COMMANDS = {"help", "帮助", "list", "add", "rm", "openbox", "rank", "config", "bind"}
-ADMIN_COMMANDS = {"on", "off", "star", "rank_on", "achievement_on", "achievement_off", "set", "rs", "clear", "clear_allgroup"}
+PUBLIC_COMMANDS = {"help", "帮助", "list", "add", "rm", "star", "openbox", "rank", "config", "bind"}
+ADMIN_COMMANDS = {
+    "on",
+    "off",
+    "star_on",
+    "star_off",
+    "rank_on",
+    "achievement_on",
+    "achievement_off",
+    "set",
+    "rs",
+    "clear",
+    "clear_allgroup",
+}
 
 def _group_id(event: MessageEvent) -> str:
     if isinstance(event, GroupMessageEvent):
@@ -106,7 +118,9 @@ HELP_TEXT = """Steam 状态监控指令：
 /steam off - 停止本群监控
 /steam add [SteamID/链接/好友码...] - 添加订阅
 /steam rm [SteamID/链接/好友码...] - 删除订阅
-/steam star [SteamID/链接/好友码...] - Star 玩家并推送在线状态变化（超级用户）
+/steam star [SteamID/链接/好友码...] - Star 玩家并推送在线状态变化
+/steam star_on - 开启本群 Star 功能（超级用户）
+/steam star_off - 关闭本群 Star 功能（超级用户）
 /steam bind [SteamID/链接/好友码] - 绑定自己的 QQ 与 SteamID
 /steam list - 查看所有订阅状态
 /steam openbox [SteamID/链接/好友码] - 查看玩家详情
@@ -191,6 +205,40 @@ async def _handle_public_command(
         lines = [msg for _, msg in results]
         await matcher.finish("\n".join(lines))
 
+    if sub == "star":
+        raw_ids = _split_steam_inputs(" ".join(parts[1:]))
+        if not raw_ids:
+            await matcher.finish("用法：/steam star [SteamID/链接/好友码...]")
+
+        if _is_private(event):
+            starred, already_starred, added, invalid = await service.star_private_steam_ids(
+                user_id, raw_ids, bot
+            )
+            lines: list[str] = []
+            if added:
+                lines.append("已自动添加个人监控：" + ", ".join(added))
+        else:
+            if not service.is_star_enabled(group_id):
+                await matcher.finish("本群未开启 Star 功能，请联系管理员使用 /steam star_on 开启。")
+            starred, already_starred, added, linked, invalid = await service.star_steam_ids(
+                group_id, raw_ids
+            )
+            if starred or already_starred:
+                service.remember_bot(group_id, bot)
+            lines = []
+            if added:
+                lines.append("已自动添加监控：" + ", ".join(added))
+            if linked:
+                lines.append("已自动加入本群联动推送：" + ", ".join(linked))
+
+        if starred:
+            lines.append("已 Star：" + ", ".join(starred))
+        if already_starred:
+            lines.append("已经 Star：" + ", ".join(already_starred))
+        if invalid:
+            lines.append("无法解析：" + ", ".join(invalid))
+        await matcher.finish("\n".join(lines) if lines else "未 Star 任何 SteamID。")
+
     if sub == "openbox":
         if len(parts) < 2:
             await matcher.finish("用法：/steam openbox [SteamID/链接/好友码]")
@@ -225,28 +273,18 @@ async def _handle_admin_command(matcher: Matcher, bot: Bot, event: MessageEvent,
     if sub == "off":
         await matcher.finish(service.stop_group(group_id))
 
-    if sub == "star":
+    if sub == "star_on":
         if _is_private(event):
-            await matcher.finish("/steam star 仅支持在群聊中使用。")
-        raw_ids = _split_steam_inputs(_arg_body(args))
-        if not raw_ids:
-            await matcher.finish("用法：/steam star [SteamID/链接/好友码...]")
-        starred, already_starred, added, linked, invalid = await service.star_steam_ids(group_id, raw_ids)
-        if starred or already_starred:
-            service.remember_bot(group_id, bot)
+            await matcher.finish("/steam star_on 仅支持在群聊中使用。")
+        service.remember_bot(group_id, bot)
+        service.set_star_enabled(group_id, True)
+        await matcher.finish("已开启本群 Star 功能。")
 
-        lines: list[str] = []
-        if added:
-            lines.append("已自动添加监控：" + ", ".join(added))
-        if linked:
-            lines.append("已自动加入本群联动推送：" + ", ".join(linked))
-        if starred:
-            lines.append("已 Star：" + ", ".join(starred))
-        if already_starred:
-            lines.append("已经 Star：" + ", ".join(already_starred))
-        if invalid:
-            lines.append("无法解析：" + ", ".join(invalid))
-        await matcher.finish("\n".join(lines) if lines else "未 Star 任何 SteamID。")
+    if sub == "star_off":
+        if _is_private(event):
+            await matcher.finish("/steam star_off 仅支持在群聊中使用。")
+        service.set_star_enabled(group_id, False)
+        await matcher.finish("已关闭本群 Star 功能。")
 
     if sub == "rank_on":
         param = parts[1].lower() if len(parts) >= 2 else ""
@@ -292,7 +330,7 @@ async def _handle_admin_command(matcher: Matcher, bot: Bot, event: MessageEvent,
 
     if sub == "clear_allgroup":
         service.group_steam_ids.clear()
-        service.starred_steam_ids.clear()
+        service.clear_group_stars()
         service.reset_runtime()
         service.save_static()
         await matcher.finish("已清空所有群的 SteamID。")
@@ -300,7 +338,7 @@ async def _handle_admin_command(matcher: Matcher, bot: Bot, event: MessageEvent,
     if sub == "clear":
         target = parts[1] if len(parts) >= 2 else group_id
         service.group_steam_ids.pop(target, None)
-        service.starred_steam_ids.pop(target, None)
+        service.clear_group_star(target)
         service.group_last_states.pop(target, None)
         service.group_start_play_times.pop(target, None)
         service.group_pending_quit.pop(target, None)

@@ -17,6 +17,7 @@ from .steam_api import PlayerStatus, SteamApi
 from .storage import JsonStore
 
 PRIVATE_SCOPE_PREFIX = "private:"
+STAR_GROUP_SCOPE_PREFIX = "star-group:"
 
 
 PERSONA_TEXT = {
@@ -130,9 +131,22 @@ class SteamStatusService:
             return scope_id.removeprefix(PRIVATE_SCOPE_PREFIX)
         return None
 
+    @staticmethod
+    def star_group_scope(group_id: str) -> str:
+        return f"{STAR_GROUP_SCOPE_PREFIX}{group_id}"
+
+    @staticmethod
+    def _star_group_id(scope_id: str) -> str | None:
+        if scope_id.startswith(STAR_GROUP_SCOPE_PREFIX):
+            return scope_id.removeprefix(STAR_GROUP_SCOPE_PREFIX)
+        return None
+
     def _scope_label(self, scope_id: str) -> str:
         user_id = self._private_user_id(scope_id)
-        return f"私聊 {user_id}" if user_id else f"群 {scope_id}"
+        if user_id:
+            return f"私聊 {user_id}"
+        star_group_id = self._star_group_id(scope_id)
+        return f"群 {star_group_id} Star" if star_group_id else f"群 {scope_id}"
 
     def set_group_enabled(self, group_id: str, enabled: bool) -> None:
         self.group_flags.setdefault(group_id, {})["monitor"] = enabled
@@ -143,6 +157,18 @@ class SteamStatusService:
 
     def set_achievement_enabled(self, group_id: str, enabled: bool) -> None:
         self.group_flags.setdefault(group_id, {})["achievement"] = enabled
+        self.save_static()
+
+    def is_star_enabled(self, group_id: str) -> bool:
+        return self.group_flags.get(group_id, {}).get("star", False)
+
+    def set_star_enabled(self, group_id: str, enabled: bool) -> None:
+        self.group_flags.setdefault(group_id, {})["star"] = enabled
+        if not enabled:
+            scope_id = self.star_group_scope(group_id)
+            self.next_poll_time.pop(scope_id, None)
+            self.group_last_states.pop(scope_id, None)
+            self.save_runtime()
         self.save_static()
 
     def _get_push_bot(self, group_id: str) -> Bot | None:
@@ -340,6 +366,27 @@ class SteamStatusService:
         self.save_static()
         return starred, already_starred, added, linked, invalid
 
+    async def star_private_steam_ids(
+        self, user_id: str, raw_values: list[str], bot: Bot
+    ) -> tuple[list[str], list[str], list[str], list[str]]:
+        added, already, invalid = await self.subscribe_private(user_id, raw_values, bot)
+        scope_id = self.private_scope(str(user_id))
+        monitored = list(dict.fromkeys([*added, *already]))
+        scope_starred = self.starred_steam_ids.setdefault(scope_id, [])
+        starred: list[str] = []
+        already_starred: list[str] = []
+        for sid in monitored:
+            if sid in scope_starred:
+                already_starred.append(sid)
+            else:
+                scope_starred.append(sid)
+                starred.append(sid)
+
+        if not scope_starred:
+            self.starred_steam_ids.pop(scope_id, None)
+        self.save_static()
+        return starred, already_starred, added, invalid
+
     async def subscribe_private(
         self, user_id: str, raw_values: list[str], bot: Bot
     ) -> tuple[list[str], list[str], list[str]]:
@@ -396,6 +443,7 @@ class SteamStatusService:
             if sid in ids:
                 ids.remove(sid)
                 removed.append(sid)
+                self._remove_star(scope_id, sid)
                 self._clear_scope_sid(scope_id, sid)
             else:
                 missing.append(sid)
@@ -420,12 +468,25 @@ class SteamStatusService:
                 self.achievement_tasks.pop(key, None)
                 self.achievement_snapshots.pop(key, None)
 
-    def _remove_star(self, group_id: str, sid: str) -> None:
-        starred = self.starred_steam_ids.get(group_id, [])
+    def _remove_star(self, scope_id: str, sid: str) -> None:
+        starred = self.starred_steam_ids.get(scope_id, [])
         if sid in starred:
             starred.remove(sid)
         if not starred:
-            self.starred_steam_ids.pop(group_id, None)
+            self.starred_steam_ids.pop(scope_id, None)
+        if self._private_user_id(scope_id) is None:
+            self._clear_scope_sid(self.star_group_scope(scope_id), sid)
+
+    def clear_group_star(self, group_id: str) -> None:
+        self.starred_steam_ids.pop(group_id, None)
+        scope_id = self.star_group_scope(group_id)
+        self.next_poll_time.pop(scope_id, None)
+        self.group_last_states.pop(scope_id, None)
+
+    def clear_group_stars(self) -> None:
+        for scope_id in list(self.starred_steam_ids):
+            if self._private_user_id(scope_id) is None:
+                self.clear_group_star(scope_id)
 
     async def delete_steam_id(self, group_id: str, raw_value: str) -> tuple[bool, str]:
         sid = await self.api.resolve_steam_input(raw_value)
@@ -516,6 +577,19 @@ class SteamStatusService:
                     scope_sids[scope_id] = due
                     all_sids.update(due)
 
+            for group_id, ids in self.starred_steam_ids.items():
+                if self._private_user_id(group_id) or not self.is_star_enabled(group_id):
+                    continue
+                scope_id = self.star_group_scope(group_id)
+                due = [
+                    sid
+                    for sid in ids
+                    if now >= self.next_poll_time.setdefault(scope_id, {}).get(sid, 0)
+                ]
+                if due:
+                    scope_sids[scope_id] = due
+                    all_sids.update(due)
+
             if not scope_sids:
                 await self._finalize_due_quits()
                 return
@@ -524,13 +598,38 @@ class SteamStatusService:
             logs: list[str] = []
             for scope_id, ids in scope_sids.items():
                 for sid in ids:
-                    line = await self._process_status(scope_id, sid, status_map.get(sid))
+                    if self._star_group_id(scope_id):
+                        line = await self._process_star_group_status(
+                            scope_id, sid, status_map.get(sid)
+                        )
+                    else:
+                        line = await self._process_status(scope_id, sid, status_map.get(sid))
                     if line:
                         logs.append(f"{self._scope_label(scope_id)}: {line}")
             await self._finalize_due_quits()
             self.save_runtime()
             if logs and self.config.get("detailed_poll_log", True):
                 logger.info("[steam_status_monitor] 轮询完成\n" + "\n".join(logs))
+
+    async def _process_star_group_status(
+        self, scope_id: str, sid: str, status: PlayerStatus | None
+    ) -> str | None:
+        if not status:
+            self._schedule_next_poll(scope_id, sid, None)
+            return f"{sid} 状态获取失败"
+
+        states = self.group_last_states.setdefault(scope_id, {})
+        prev = states.get(sid)
+        player_name = self.display_name(sid, status.name)
+        if prev and int(prev.get("personastate") or 0) != status.personastate:
+            await self._send_starred_persona_change(
+                scope_id, sid, player_name, status.personastate
+            )
+        states[sid] = status.to_json()
+        self._schedule_next_poll(scope_id, sid, status)
+        return self._status_line(
+            player_name, status, status.gameextrainfo or "未知游戏"
+        )
 
     async def _process_status(
         self, group_id: str, sid: str, status: PlayerStatus | None
@@ -558,7 +657,7 @@ class SteamStatusService:
 
         previous_persona = int(prev.get("personastate") or 0)
         if (
-            self._private_user_id(group_id) is None
+            self._private_user_id(group_id)
             and previous_persona != status.personastate
         ):
             await self._send_starred_persona_change(
@@ -694,13 +793,23 @@ class SteamStatusService:
         return f"{name} 离线"
 
     async def _send_starred_persona_change(
-        self, owner_group_id: str, sid: str, player_name: str, personastate: int
+        self, scope_id: str, sid: str, player_name: str, personastate: int
     ) -> None:
         state_text = STAR_PERSONA_TEXT.get(personastate, "状态发生变化")
         text = f"【Steam 状态】{player_name} {state_text}"
-        for target_group in self._target_groups(owner_group_id, sid):
-            if sid in self.starred_steam_ids.get(target_group, []):
-                await self.send_group_text(target_group, text)
+        user_id = self._private_user_id(scope_id)
+        if user_id:
+            if sid in self.starred_steam_ids.get(scope_id, []):
+                await self.send_private_text(user_id, text)
+            return
+
+        group_id = self._star_group_id(scope_id)
+        if (
+            group_id
+            and self.is_star_enabled(group_id)
+            and sid in self.starred_steam_ids.get(group_id, [])
+        ):
+            await self.send_group_text(group_id, text)
 
     def _record_quit(self, sid: str, gameid: str, info: dict[str, Any]) -> tuple[str, float]:
         info["notified"] = True
